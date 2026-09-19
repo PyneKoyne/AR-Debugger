@@ -74,10 +74,20 @@ const uint32_t VISION_PERIOD_MS = 2000;   // min gap between OpenAI dispatches
 #define STATUS_LED_PIN   33
 const uint32_t BLINK_MS = 80;
 
-const uint32_t CONNECT_TIMEOUT_MS = 15000;
-const uint32_t FIRST_BYTE_TIMEOUT = 15000;
+// Fail fast: a healthy call is ~1 s, so waiting 15-20 s on a dead link only
+// freezes detection. A failed call is simply retried with the next frame.
+const uint32_t CONNECT_TIMEOUT_MS = 6000;    // TCP connect + socket send/recv
+const uint32_t HANDSHAKE_TIMEOUT_S = 8;      // TLS handshake
+const uint32_t FIRST_BYTE_TIMEOUT = 8000;
 const uint32_t KEEPALIVE_MAX_MS   = 20000;   // reconnect if idle longer
-const uint32_t READ_IDLE_TIMEOUT  = 15000;
+const uint32_t READ_IDLE_TIMEOUT  = 5000;
+
+// Self-healing (see netSupervisor)
+const uint32_t WIFI_DOWN_RECONNECT_MS = 30000;   // link down this long -> re-join
+const uint32_t FORCE_RECONNECT_GAP_MS = 30000;   // min gap between forced re-joins
+const uint32_t API_FAIL_RECONNECT     = 3;       // consecutive failed calls -> re-join
+const uint32_t REBOOT_AFTER_MS        = 180000;  // no HTTP response at all -> reboot
+const uint32_t VISION_STALE_MS        = 20000;   // older result => treat as "nobody"
 
 #define DESC_MAX 96
 
@@ -137,6 +147,12 @@ static uint8_t *g_snapBuf = nullptr;
 static size_t   g_snapLen = 0;
 
 static bool cameraOk = false;
+
+// Network health, written by the vision task / Wi-Fi events, read by loop().
+static volatile uint32_t g_lastNetOk    = 0;      // last complete HTTP response
+static volatile uint32_t g_apiFailStreak = 0;     // consecutive transport failures
+static volatile bool     g_dropTls      = false;  // Wi-Fi changed: discard socket
+static uint32_t          g_visionOkAt   = 0;      // last parsed detection (state lock)
 
 // Guarded lock helpers - never assert on a null handle.
 static inline bool lockState() {
@@ -393,6 +409,11 @@ static void tlsClose() {
 }
 
 static bool tlsAlive() {
+  if (g_dropTls) {                  // Wi-Fi re-joined / IP changed: socket is dead
+    g_dropTls = false;
+    tlsClose();
+    return false;
+  }
   return g_tls && g_tls->connected() && (millis() - g_tlsLastUse) < KEEPALIVE_MAX_MS;
 }
 
@@ -403,8 +424,8 @@ static bool tlsOpen() {
   }
   g_tls->stop();
   g_tls->setInsecure();
-  g_tls->setTimeout(15);            // SECONDS on the ESP32 core
-  g_tls->setHandshakeTimeout(15);
+  g_tls->setHandshakeTimeout(HANDSHAKE_TIMEOUT_S);   // seconds; socket timeout is
+                                                     // CONNECT_TIMEOUT_MS (ms), set by connect()
   if (!g_tls->connect(OPENAI_HOST, OPENAI_PORT, CONNECT_TIMEOUT_MS)) return false;
   g_tls->setNoDelay(true);
   g_tlsLastUse = millis();
@@ -447,6 +468,7 @@ static bool askOpenAI(const uint8_t *jpeg, size_t jpegLen,
     if (!reused && !tlsOpen()) {
       Serial.println("[vision] TLS connect failed");
       tlsClose();
+      g_apiFailStreak = g_apiFailStreak + 1;
       return false;
     }
     tConn = millis();
@@ -460,6 +482,7 @@ static bool askOpenAI(const uint8_t *jpeg, size_t jpegLen,
       tlsClose();
       if (reused) { Serial.println("[vision] stale connection, retrying"); continue; }
       Serial.println("[vision] write failed");
+      g_apiFailStreak = g_apiFailStreak + 1;
       return false;
     }
     tSent = millis();
@@ -469,12 +492,15 @@ static bool askOpenAI(const uint8_t *jpeg, size_t jpegLen,
       tlsClose();
       if (reused) { Serial.println("[vision] stale connection, retrying"); continue; }
       Serial.printf("[vision] no usable response (HTTP %d)\n", status);
+      g_apiFailStreak = g_apiFailStreak + 1;
       return false;
     }
   }
-  if (!ok) return false;
+  if (!ok) { g_apiFailStreak = g_apiFailStreak + 1; return false; }
 
   uint32_t tDone = millis();
+  g_apiFailStreak = 0;                 // a complete HTTP response = link works
+  g_lastNetOk = tDone;
   if (keep) g_tlsLastUse = tDone; else tlsClose();
 
   JsonDocument filter;
@@ -483,8 +509,9 @@ static bool askOpenAI(const uint8_t *jpeg, size_t jpegLen,
 
   JsonDocument doc;
   if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) {
-    Serial.println("[vision] outer JSON parse failed");
+    Serial.printf("[vision] outer JSON parse failed (HTTP %d)\n", status);
     Serial.println(body.substring(0, 300));
+    tlsClose();                        // resync the byte stream
     return false;
   }
 
@@ -568,6 +595,7 @@ static void visionTask(void *arg) {
       if (ok) {
         g_human = human;
         g_face  = face;
+        g_visionOkAt = millis();
         strncpy(g_desc, desc, sizeof(g_desc) - 1);
         g_desc[sizeof(g_desc) - 1] = '\0';
         g_visionSeq++;
@@ -609,6 +637,82 @@ static bool dispatchVision(camera_fb_t *fb) {
 #endif
 
 // ============================================================
+//  WI-FI  (owned by the sketch; ARDB only gets a status callback)
+// ============================================================
+// Disconnect reason codes worth knowing:
+//   200 BEACON_TIMEOUT (AP too weak / radio starved)   201 NO_AP_FOUND
+//   2 AUTH_EXPIRE   15 4WAY_HANDSHAKE_TIMEOUT   202 AUTH_FAIL   8 ASSOC_LEAVE (us)
+static void onWifiEvent(arduino_event_id_t event, arduino_event_info_t info) {
+  switch (event) {
+    case ARDUINO_EVENT_WIFI_STA_DISCONNECTED:
+      Serial.printf("[wifi] disconnected, reason %u\n",
+                    (unsigned)info.wifi_sta_disconnected.reason);
+      break;
+    case ARDUINO_EVENT_WIFI_STA_GOT_IP:
+      Serial.printf("[wifi] got IP %s, RSSI %d\n",
+                    WiFi.localIP().toString().c_str(), (int)WiFi.RSSI());
+      g_dropTls = true;             // any old socket belongs to the previous link
+      break;
+    default:
+      break;
+  }
+}
+
+static void wifiJoin() {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+}
+
+static void wifiStart() {
+  WiFi.onEvent(onWifiEvent);
+  WiFi.persistent(false);
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setAutoReconnect(true);
+  // Default is FAST_SCAN: join the FIRST matching AP. On a multi-AP network
+  // that is often a weak one. Scan every channel and take the strongest.
+  WiFi.setScanMethod(WIFI_ALL_CHANNEL_SCAN);
+  WiFi.setSortMethod(WIFI_CONNECT_AP_BY_SIGNAL);
+  wifiJoin();
+}
+
+// Runs once a second from loop(). Repairs the connection instead of waiting
+// on it, and reboots as a last resort.
+static void netSupervisor() {
+  static uint32_t nextCheck = 0;
+  static uint32_t downSince = 0;
+  static uint32_t lastForce = 0;
+
+  uint32_t now = millis();
+  if ((int32_t)(now - nextCheck) < 0) return;
+  nextCheck = now + 1000;
+
+  bool up = WiFi.status() == WL_CONNECTED;
+  if (up) downSince = 0;
+  else if (!downSince) downSince = now;
+
+  bool stuckDown = !up && (now - downSince) > WIFI_DOWN_RECONNECT_MS;
+  bool apiDead   = up && g_apiFailStreak >= API_FAIL_RECONNECT;
+
+  if ((stuckDown || apiDead) && (now - lastForce) > FORCE_RECONNECT_GAP_MS) {
+    lastForce = now;
+    Serial.printf("[net] re-joining Wi-Fi (%s)\n",
+                  stuckDown ? "link down too long" : "OpenAI unreachable");
+    g_dropTls = true;
+    WiFi.disconnect(false, false);
+    wifiJoin();
+  }
+
+#if ENABLE_VISION
+  if ((now - g_lastNetOk) > REBOOT_AFTER_MS) {
+    Serial.println("[net] no HTTP response for 3 min, rebooting");
+    Serial.flush();
+    delay(100);
+    ESP.restart();
+  }
+#endif
+}
+
+// ============================================================
 //  SETUP
 // ============================================================
 void setup() {
@@ -647,18 +751,14 @@ void setup() {
   // "assert failed: xQueueSemaphoreTake ... (pxQueue)" (null lwIP lock).
   // The sketch owns Wi-Fi; ARDB only gets a status callback.
   Serial.println("[boot] starting Wi-Fi");
-  WiFi.persistent(false);
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  wifiStart();
 
 #if ENABLE_ARDB
   Serial.println("[boot] constructing ARDB");
   ardbTransport = new WiFiClient();
   ardbConfig    = new ARDBConfig(ARDBConfig::wifiMqtt(
                       WIFI_SSID, WIFI_PASS, MQTT_HOST, ARDB_CLIENT_ID,
-                      MQTT_PORT, /*retrySeconds=*/2, /*enabled=*/true));
+                      MQTT_PORT, /*retrySeconds=*/5, /*enabled=*/true));
   ardbNetwork   = new ARDBNetworkCallbacks(nullptr, wifiIsConnected);
   ardb          = new ARDBClient(*ardbTransport, *ardbNetwork, *ardbConfig);
 
@@ -678,6 +778,7 @@ void setup() {
   xTaskCreatePinnedToCore(visionTask, "vision", 16384, nullptr, 1, nullptr, 0);
 #endif
 
+  g_lastNetOk = millis();            // start the connectivity clock at boot
   Serial.printf("[boot] setup complete, heap %u\n", (unsigned)ESP.getFreeHeap());
 }
 
@@ -716,13 +817,17 @@ void loop() {
   }
 #endif
 
+  netSupervisor();
+
   // Heartbeat so a silent board is distinguishable from a hung one.
   if ((int32_t)(millis() - nextHeartbeat) >= 0) {
     nextHeartbeat = millis() + 5000;
-    Serial.printf("[hb] up %lus heap %u wifi %d",
+    Serial.printf("[hb] up %lus heap %u/%u wifi %d rssi %d fails %lu",
                   (unsigned long)(millis() / 1000),
                   (unsigned)ESP.getFreeHeap(),
-                  (int)WiFi.status());
+                  (unsigned)ESP.getMaxAllocHeap(),
+                  (int)WiFi.status(), (int)WiFi.RSSI(),
+                  (unsigned long)g_apiFailStreak);
 #if ENABLE_ARDB
     if (ardb) Serial.printf(" ardb %d (state %d, err %d, sent %lu, dropped %lu)",
                             ardb->connected() ? 1 : 0, (int)ardb->state(),
@@ -752,16 +857,21 @@ void loop() {
   }
 
   bool     human = false, face = false;
-  uint32_t seq = 0;
+  uint32_t seq = 0, okAt = 0;
   char     desc[DESC_MAX] = "";
   if (lockState()) {
     human = g_human;
     face  = g_face;
     seq   = g_visionSeq;
+    okAt  = g_visionOkAt;
     strncpy(desc, g_desc, sizeof(desc));
     desc[sizeof(desc) - 1] = '\0';
     unlockState();
   }
+
+  // Fail safe: if detection has gone stale (network down) don't leave the
+  // high-current flash lit on an old result.
+  if (!okAt || (millis() - okAt) > VISION_STALE_MS) { human = false; face = false; }
 
   flashLed(face);                     // bright flash while a face is in frame
 
