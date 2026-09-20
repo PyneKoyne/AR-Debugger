@@ -1,3 +1,10 @@
 ARDBBroker/HeadCredentials.h
 ARDBBroker/BrokerNetworkCredentials.h
 main_broke/
+
+# Real credentials -- never commit. Templates (arduino_secrets.h.example /
+# arduino_secrets.example.h) are intentionally NOT matched by these patterns.
+arduino_secrets.h
+secrets.h
+
+.DS_Store
