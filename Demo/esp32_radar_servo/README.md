@@ -1,8 +1,7 @@
 # ESP32 servo radar -> ARDB
 
-A servo pans an HC-SR04 across a 180-degree arc. Each step publishes one polar
-sample to the ARDB head, plus its Cartesian projection and a per-sweep nearest
--target report.
+A servo pans an HC-SR04 across a 180-degree arc. Each step publishes **one
+8-byte packet on one stream**: bearing and range, nothing else.
 
 Status: compiles clean for `esp32:esp32:esp32` (core 3.3.6) with
 `--warnings all`. Not yet run against hardware or a live head.
@@ -30,8 +29,11 @@ arduino-cli compile --fqbn esp32:esp32:esp32 .
 arduino-cli upload  --fqbn esp32:esp32:esp32 -p /dev/cu.usbserial-XXXX .
 ```
 
-Set `ENABLE_ARDB 0` at the top of the sketch to sweep and print to Serial with
-no network at all — the fastest way to tell a wiring fault from a broker fault.
+`ENABLE_ARDB 0` at the top of the sketch drops the ARDB client and prints the
+sweep to Serial — the fastest way to tell a wiring fault from a broker fault.
+It does **not** currently skip Wi-Fi: the sketch still includes
+`arduino_secrets.h` and still calls `wifiStart()`/`netSupervisor()`. Making the
+Wi-Fi path conditional too is an open item below.
 
 ## Polar form
 
@@ -63,28 +65,36 @@ here and the Quest decoder must mirror them. Every float is IEEE-754 binary32
 
 | MQTT topic | Type | Bytes | Payload |
 | --- | --- | --- | --- |
-| `a/radar/polar` | `THREE_NUM` (6) | 12 | `float[3] { thetaDeg, rCm, valid }` |
-| `a/radar/pt` | `Vector3F32` (2) | 12 | `float[3] { x, y, z }` in **metres** |
-| `a/radar/r` | `ScalarF32` (1) | 4 | `float rCm` |
-| `a/radar/near` | `THREE_NUM` (6) | 12 | `float[3] { thetaDeg, rCm, sweepIndex }` |
-| `a/radar/log` | `Log` (0) | var | UTF-8 text, no NUL terminator |
+| `a/radar` | `Binary` (255) | 8 | `float[2] { thetaDeg, rCm }` |
+
+| offset | bytes | field | meaning |
+| --- | --- | --- | --- |
+| 0 | 4 | `thetaDeg` | bearing, 0–180, as described above |
+| 4 | 4 | `rCm` | range in cm from the sensor face; **0.0 = no echo** |
+
+Worked example — bearing 90°, range 123.4 cm:
+
+```
+app bytes : 00 00 B4 42  CD CC F6 42     (8 bytes)
+on MQTT   : <those 8 bytes> 91 8D        (+ CRC-16/CCITT-FALSE, big-endian)
+```
 
 Decoder notes, in the order they will bite:
 
-- **`polar.valid` is the flag to read, not `rCm`.** An empty bearing publishes
-  `rCm = 0.0` with `valid = 0.0`. Plot the radius without checking the flag and
-  every empty bearing becomes a contact sitting on the sensor's own origin.
-- **`a/radar/pt` is published only for valid echoes.** An absent sample means
-  "nothing at that bearing", not "something at (0,0,0)". Same for `a/radar/r`.
-- **`pt` is Unity-handed**: +x right, +y up, +z forward, origin at the sensor
-  face. `y` is always 0 because the servo only pans. `x = r·cos θ`,
-  `z = r·sin θ`, converted cm → m.
-- **`near.sweepIndex` counts passes from boot** and doubles as a uniqueness
-  salt: the head drops a sample byte-identical to the one it already holds, so
-  without it two consecutive passes finding the same target at the same bearing
-  would publish once, not twice.
-- `near` is emitted once per completed pass, and skipped entirely for a pass
-  with no echo.
+- **`rCm == 0.0` is the no-echo sentinel, not a target at the origin.** With
+  only two fields there is nowhere to put a validity flag, so zero carries it.
+  Zero is safe for this because a real reading is always ≥ `MIN_RANGE_CM`. Plot
+  `rCm` without testing for zero and every empty bearing draws a false contact
+  on top of the sensor.
+- **Every step publishes, echo or not.** That is deliberate: a packet per step
+  lets the viewer clear a stale contact instead of leaving the last hit on
+  screen forever.
+- **`Binary` carries no schema.** The enum has no two-number type, so the
+  length and this table are the entire contract. Decode the two floats as
+  little-endian binary32.
+- Consecutive packets always differ, because `thetaDeg` changes every step —
+  which matters, since the head drops a sample byte-identical to the one it
+  already holds.
 
 ## Timing
 
@@ -110,10 +120,14 @@ limit against a 100 ms step drops a point whenever a publish takes longer than
 
 ## Open items for integration
 
+- **Wi-Fi is not yet optional.** `ENABLE_ARDB 0` removes the ARDB client but
+  not the Wi-Fi join or the `arduino_secrets.h` include, so a bench test
+  without credentials still needs the file to exist. Guarding those on
+  `ENABLE_ARDB` would make the radar genuinely standalone.
 - `.gitignore` excludes only `Demo/esp32cam_openai_vision/arduino_secrets.h`.
   Add `Demo/esp32_radar_servo/arduino_secrets.h` before committing real
   credentials.
-- 5 streams are registered; both the client (`ARDB_MAX_TOPICS`) and the head
-  (`ARDB_HEAD_MAX_STREAMS`) default to 8, and the ESP32-CAM demo registers 4.
-  Running both publishers against one head exceeds that cap.
-- No Quest decoder exists for `THREE_NUM` under this schema yet.
+- 1 stream is registered now, against a cap of 8 on both the client
+  (`ARDB_MAX_TOPICS`) and the head (`ARDB_HEAD_MAX_STREAMS`). The ESP32-CAM
+  demo registers 4, so both publishers now fit on one head with room to spare.
+- No Quest decoder exists for this layout yet.
