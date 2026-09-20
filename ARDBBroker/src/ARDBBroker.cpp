@@ -13,7 +13,10 @@ Runtime::Runtime(const ardb_network::Config& network, const char* certificatePem
       privateKeyPem_(privateKeyPem),
       broker_(mqttPort, retainedMessageCapacity),
       telemetry_(broker_),
-      headHttps_(telemetry_, certificatePem, privateKeyPem) {}
+      headHttps_(telemetry_, certificatePem, privateKeyPem),
+      localNetworkValidation_(
+          network_.mode == ardb_network::Mode::AccessPoint &&
+          ARDB_HEAD_ENABLE_LOCAL_NETWORK_VALIDATION != 0) {}
 
 bool Runtime::begin() {
   if (certificatePem_ == nullptr || privateKeyPem_ == nullptr ||
@@ -28,12 +31,14 @@ bool Runtime::begin() {
   broker_.begin();
   telemetry_.begin();
   headHttps_.begin();
+  localNetworkValidation_.begin();
   return true;
 }
 
 void Runtime::update() {
   broker_.loop();
   headHttps_.update();
+  localNetworkValidation_.update();
   yield();
 }
 

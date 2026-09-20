@@ -1,7 +1,7 @@
 /*
  * ESP32-CAM -> ARDB (MQTT) + OpenAI person detection
  *
- *   Core 1 (loop):  capture at 2 Hz -> publish JPEG + detection state to ARDB
+ *   Core 1 (loop):  capture at 2 Hz -> publish detection state to ARDB
  *   Core 0 (task):  at most every VISION_PERIOD_MS, ask OpenAI "is a person
  *                   visible?" plus a short scene description, over one
  *                   persistent (keep-alive) TLS connection
@@ -89,7 +89,9 @@ const uint32_t API_FAIL_RECONNECT     = 3;       // consecutive failed calls -> 
 const uint32_t REBOOT_AFTER_MS        = 180000;  // no HTTP response at all -> reboot
 const uint32_t VISION_STALE_MS        = 20000;   // older result => treat as "nobody"
 
-#define DESC_MAX 96
+// ARDB Log payloads are capped at 256 application bytes. Keep room for the
+// NUL terminator while ensuring every scene description can be published.
+#define DESC_MAX 257
 
 // ============================================================
 //  CAMERA PINS - AI Thinker
@@ -124,10 +126,9 @@ static ARDBClient *ardb          = nullptr;
 
 static bool wifiIsConnected() { return WiFi.status() == WL_CONNECTED; }
 
-static ARDBTopic tImage;   // 1
-static ARDBTopic tHuman;   // 2
-static ARDBTopic tDesc;    // 3
-static ARDBTopic tLog;     // 4
+static ARDBTopic tHuman;   // 1
+static ARDBTopic tDesc;    // 2
+static ARDBTopic tLog;     // 3
 static bool ardbReady = false;
 #endif
 
@@ -763,8 +764,13 @@ void setup() {
   ardb          = new ARDBClient(*ardbTransport, *ardbNetwork, *ardbConfig);
 
   Serial.println("[boot] registering topics");
-  tImage = ardb->addTopic("a/cam/img", ARDBVisualType::Binary,    "Camera JPEG");
-  tHuman = ardb->addTopic("a/cam/h",   ARDBVisualType::ScalarF32, "Human present");
+  // The ARDB head accepts one latest-value sample of at most 256 application
+  // bytes. A camera JPEG is several KiB, so registering it as Binary would
+  // make every frame fail the broker's size check. Publish camera media via a
+  // separate endpoint or add a deliberately versioned chunking protocol;
+  // ARDB telemetry below remains within the live-stream contract.
+  tHuman = ardb->addTopic("a/cam/h", ARDBVisualType::ScalarF32,
+                          "Human present", sizeof(float));
   tDesc  = ardb->addTopic("a/cam/d",   ARDBVisualType::Log,       "Scene description");
   tLog   = ardb->addTopic("a/cam/log", ARDBVisualType::Log,       "Device status");
 
@@ -877,12 +883,11 @@ void loop() {
 
 #if ENABLE_ARDB
   if (ardbReady && ardb && ardb->connected()) {
-    ardb->printBytes(tImage, fb->buf, fb->len);
     ardb->print(tHuman, human ? 1.0f : 0.0f);
 
-    // String() picks the documented text overload. Passing the char[96]
+    // String() picks the documented text overload. Passing the character
     // buffer directly would match the fixed-size-array overload and publish
-    // all 96 bytes, trailing garbage included.
+    // every element instead of only the description text.
     if (desc[0] && (seq != lastSeqSent || human != lastHuman || firstPublish)) {
       ardb->print(tDesc, String(desc));
       lastSeqSent  = seq;

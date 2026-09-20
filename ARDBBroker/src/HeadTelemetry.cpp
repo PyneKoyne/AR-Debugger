@@ -134,7 +134,7 @@ size_t HeadTelemetry::buildSampleRecord(size_t streamIndex, uint8_t* output,
   }
   const StreamSlot& stream = streams_[streamIndex];
   const SampleSlot& sample = stream.sample;
-  constexpr size_t kSamplePrefixBytes = 4;
+  constexpr size_t kSamplePrefixBytes = 5;
   const size_t required = kSamplePrefixBytes + sample.length;
   if (!sample.valid || outputCapacity < required) {
     return 0;
@@ -144,7 +144,7 @@ size_t HeadTelemetry::buildSampleRecord(size_t streamIndex, uint8_t* output,
   output[0] = stream.id;
   writeU16(&output[1],
            ageMs > 0xffffUL ? 0xffffU : static_cast<uint16_t>(ageMs));
-  output[3] = sample.length;
+  writeU16(&output[3], sample.length);
   if (sample.length != 0) {
     memcpy(&output[kSamplePrefixBytes], sample.payload, sample.length);
   }
@@ -319,7 +319,7 @@ void HeadTelemetry::ingestSample(const Topic& topic, const char* payload,
   if (applicationLength != 0) {
     memcpy(sample.payload, bytes, applicationLength);
   }
-  sample.length = static_cast<uint8_t>(applicationLength);
+  sample.length = static_cast<uint16_t>(applicationLength);
   sample.valid = true;
   ++generation_;
 }

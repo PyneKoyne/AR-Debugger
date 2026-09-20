@@ -193,7 +193,8 @@ ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type,
                                const char* name,
                                uint16_t expectedPayloadBytes) {
   if (!hasText(topic) || !hasText(name) || strlen(topic) > 255 ||
-      strlen(name) > 255 || expectedPayloadBytes > 64) {
+      strlen(name) > 255 ||
+      expectedPayloadBytes > ARDB_MAX_APPLICATION_PAYLOAD_BYTES) {
     return ARDBTopic();
   }
 
@@ -244,6 +245,13 @@ bool ARDBClient::publish(const ARDBTopic& topic, const void* data, size_t length
   }
   if (descriptor->expectedPayloadBytes != 0 &&
       length != descriptor->expectedPayloadBytes) {
+    return false;
+  }
+  // Registered ARDB streams are forwarded by the head as a single sample
+  // record, whose implementation has a bounded latest-value cache. Refuse an
+  // oversize variable payload locally instead of sending a packet the head
+  // must reject. Direct publish(const char*, ...) remains MQTT interop.
+  if (length > ARDB_MAX_APPLICATION_PAYLOAD_BYTES) {
     return false;
   }
 

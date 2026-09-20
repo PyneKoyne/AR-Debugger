@@ -7,7 +7,7 @@
 #include "HeadProtocol.h"
 #include "HeadTelemetry.h"
 
-// Owns the AHSP/3 session sequence and delta cache. It is portable across
+// Owns the AHSP/4 session sequence and delta cache. It is portable across
 // Arduino targets: platform code only decides how bytes reach an HTTPS peer.
 class HeadStreamSession {
  public:
@@ -40,7 +40,7 @@ class HeadStreamSession {
   uint32_t observedRegistryGeneration_;
   uint8_t lastSentPayloads_[ardb_head::kMaxStreams]
                            [ardb_head::kMaxApplicationPayloadBytes];
-  uint8_t lastSentPayloadLengths_[ardb_head::kMaxStreams];
+  uint16_t lastSentPayloadLengths_[ardb_head::kMaxStreams];
   bool lastSentValuesValid_[ardb_head::kMaxStreams];
   uint16_t pendingRecordOffsets_[ardb_head::kMaxStreams];
   bool pendingSamples_[ardb_head::kMaxStreams];

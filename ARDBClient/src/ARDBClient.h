@@ -14,7 +14,14 @@
 #define ARDB_METADATA_TOPIC_MAX_LENGTH 96
 #endif
 
+#ifndef ARDB_MAX_APPLICATION_PAYLOAD_BYTES
+#define ARDB_MAX_APPLICATION_PAYLOAD_BYTES 256
+#endif
+
 static_assert(ARDB_MAX_TOPICS < 255, "ARDB_MAX_TOPICS must fit in an 8-bit topic id");
+static_assert(ARDB_MAX_APPLICATION_PAYLOAD_BYTES > 0 &&
+                  ARDB_MAX_APPLICATION_PAYLOAD_BYTES <= 256,
+              "ARDB_MAX_APPLICATION_PAYLOAD_BYTES cannot exceed the ARDB head limit");
 
 // The Quest uses this value to choose how to decode a topic's binary payload.
 enum class ARDBVisualType : uint8_t {
@@ -147,7 +154,8 @@ class ARDBClient {
   // literals and global const character arrays are ideal; Arduino String is not.
   // A returned invalid handle means the descriptor could not be registered.
   // expectedPayloadBytes is the fixed application-byte length sent on this
-  // topic. Zero permits variable payloads up to the head node's limit.
+  // topic. Zero permits variable payloads up to
+  // ARDB_MAX_APPLICATION_PAYLOAD_BYTES.
   ARDBTopic addTopic(const char* topic, ARDBVisualType type, const char* name,
                      uint16_t expectedPayloadBytes = 0);
   ARDBTopic add_topic(const char* topic, ARDBVisualType type, const char* name,

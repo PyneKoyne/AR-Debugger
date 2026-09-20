@@ -110,7 +110,9 @@ publishes are dropped immediately and counted by `droppedPackets()`.
 
 `addTopic(topic, type, name, expectedPayloadBytes)` returns an `ARDBTopic`
 handle and registers a descriptor. `expectedPayloadBytes` is the fixed
-application-byte length; use `0` for a variable payload. On MQTT connect, and then every `metadataResendMs`,
+application-byte length; use `0` for a variable payload up to the 256-byte
+ARDB head limit. Oversize registered payloads are refused by the client so
+they do not reach the broker only to be rejected. On MQTT connect, and then every `metadataResendMs`,
 ARDBClient sends one descriptor per topic to
 `ardb/meta/<clientId>/<topic-id>` (or the configured prefix). When
 `metadataRetained` is true, configure the TinyMqtt broker with enough retained

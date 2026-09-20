@@ -113,7 +113,7 @@ bool HeadStreamSession::sendSampleBatch(HeadByteWriter& writer,
       }
 
       const size_t remaining = sizeof(body) - bodyLength;
-      if (remaining < 4) {
+      if (remaining < 5) {
         break;
       }
       pendingRecordOffsets_[index] = static_cast<uint16_t>(bodyLength);
@@ -146,9 +146,11 @@ bool HeadStreamSession::sendSampleBatch(HeadByteWriter& writer,
       }
 
       constexpr size_t kSamplePayloadLengthOffset = 3;
-      constexpr size_t kSamplePayloadOffset = 4;
+      constexpr size_t kSamplePayloadOffset = 5;
       const size_t offset = pendingRecordOffsets_[index];
-      const uint8_t payloadLength = body[offset + kSamplePayloadLengthOffset];
+      const uint16_t payloadLength =
+          static_cast<uint16_t>(body[offset + kSamplePayloadLengthOffset] << 8) |
+          static_cast<uint16_t>(body[offset + kSamplePayloadLengthOffset + 1]);
       if (payloadLength != 0) {
         memcpy(lastSentPayloads_[index], &body[offset + kSamplePayloadOffset],
                payloadLength);

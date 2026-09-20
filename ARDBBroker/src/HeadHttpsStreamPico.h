@@ -7,7 +7,7 @@
 #include "HeadStreamSession.h"
 #include "HeadTelemetry.h"
 
-// Arduino-Pico TLS transport adapter. The AHSP/3 encoder and session policy
+// Arduino-Pico TLS transport adapter. The AHSP/4 encoder and session policy
 // remain in the target-independent HeadStreamSession class.
 class HeadHttpsStream final {
  public:

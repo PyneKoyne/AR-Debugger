@@ -9,7 +9,9 @@
 namespace ardb_head {
 
 constexpr uint16_t kApiPort = 443;
-constexpr uint8_t kLiveProtocolVersion = 3;
+// Version 4 widens BASELINE/DELTA application-payload lengths from u8 to u16.
+// Quest clients must reject prior frame versions rather than misreading them.
+constexpr uint8_t kLiveProtocolVersion = 4;
 constexpr char kLivePath[] = "/api/v2/live";
 constexpr char kHealthPath[] = "/api/v2/health";
 
@@ -20,11 +22,16 @@ constexpr uint32_t kStatusPeriodMs = 5000;
 constexpr uint32_t kRequestTimeoutMs = 3000;
 constexpr uint32_t kTlsCloseFlushTimeoutMs = 20;
 
-constexpr size_t kMaxApplicationPayloadBytes = 64;
+constexpr size_t kMaxApplicationPayloadBytes = 256;
 constexpr size_t kMaxDefinitionNameBytes = 48;
 constexpr size_t kMaxMqttTopicBytes = 64;
-constexpr size_t kMaxFrameBodyBytes = 192;
+// A sample frame has a one-byte count followed by a five-byte record header.
+// Keep enough body space for one maximum-sized application payload.
+constexpr size_t kMaxFrameBodyBytes = 512;
 constexpr size_t kMaxHttpRequestBytes = 384;
+
+static_assert(kMaxFrameBodyBytes >= kMaxApplicationPayloadBytes + 6,
+              "frame body must hold a count and one maximum-sized sample");
 
 // This is a development-only default for a read-only API with no credentials.
 // Set it to the exact HTTPS origin of the Quest application before distributing
@@ -37,6 +44,14 @@ constexpr const char kCorsAllowOrigin[] = "*";
 // at all when disabled.
 #ifndef ARDB_HEAD_ENABLE_MQTT_EVENT_LOGGER
 #define ARDB_HEAD_ENABLE_MQTT_EVENT_LOGGER 0
+#endif
+
+// In access-point mode, answer the operating system's plain-HTTP network
+// validation probe locally. This keeps local-only clients associated without
+// pretending to proxy Internet traffic. Disable only when another DNS server
+// owns port 53 on the AP network.
+#ifndef ARDB_HEAD_ENABLE_LOCAL_NETWORK_VALIDATION
+#define ARDB_HEAD_ENABLE_LOCAL_NETWORK_VALIDATION 1
 #endif
 
 #ifndef ARDB_HEAD_MAX_STREAMS

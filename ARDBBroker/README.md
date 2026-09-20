@@ -3,12 +3,12 @@
 ARDBBroker provides a local raw MQTT broker and a one-way HTTPS telemetry API on the same Wi-Fi development board. The Quest runs the full WebXR application from its own HTTPS origin; this firmware never hosts the WebXR page.
 
 ```text
-ARDB publishers -- MQTT/TCP 1883 --> broker/head device -- AHSP/3 HTTPS/TCP 443 --> Quest WebXR app
+ARDB publishers -- MQTT/TCP 1883 --> broker/head device -- AHSP/4 HTTPS/TCP 443 --> Quest WebXR app
 ```
 
 ## Platform support
 
-The MQTT contract, runtime stream registry, CRC validation, latest-value cache, AHSP/3 framing, baseline/delta policy, and Quest API are shared. Only Wi-Fi and HTTPS transport are platform adapters.
+The MQTT contract, runtime stream registry, CRC validation, latest-value cache, AHSP/4 framing, baseline/delta policy, and Quest API are shared. Only Wi-Fi and HTTPS transport are platform adapters.
 
 | Target | Verified build profile | HTTPS adapter |
 | --- | --- | --- |
@@ -45,6 +45,13 @@ PEM values. The AP address field is ignored in station mode.
 | Live stream | `https://192.168.4.1/api/v2/live` |
 
 Connect both Quest and publishers to this AP. If its address changes, create a certificate with a matching IP SAN.
+
+The AP has no Internet route. To keep local-only clients that run an HTTP
+connectivity check associated, the broker answers IPv4 DNS queries with its AP
+address and returns `204 No Content` on port `80`. This is a compatibility
+responder only: it does not forward DNS, proxy HTTP, or provide Internet
+access. Define `ARDB_HEAD_ENABLE_LOCAL_NETWORK_VALIDATION` as `0` before
+including `ARDBBroker.h` to disable it.
 
 ### Existing-network mode
 
@@ -99,9 +106,9 @@ Set `ARDB_HEAD_MAX_STREAMS` before including `ARDBBroker.h` to choose capacity:
 #include <ARDBBroker.h>
 ```
 
-Every stream slot, topic string, display name, and 64-byte latest-value cache
+Every stream slot, topic string, display name, and 256-byte latest-value cache
 is statically reserved. A descriptor that exceeds the configured count, topic
-limit (64 bytes), name limit (48 bytes), or payload limit (64 bytes) is
+limit (64 bytes), name limit (48 bytes), or payload limit (256 bytes) is
 rejected. This is dynamic registration, not heap allocation. Stream IDs are
 stable until the broker restarts; after a restart, retained descriptors must be
 replayed before their data can be shown.
@@ -118,7 +125,7 @@ topic length:u8 | display-name length:u8 | topic bytes | name bytes |
 CRC-16/CCITT-FALSE:u16 BE
 ```
 
-An expected payload size of zero permits variable payloads up to 64 bytes.
+An expected payload size of zero permits variable payloads up to 256 bytes.
 The declared type, byte length, field order, units, scale, signedness, and byte
 order remain the publisher/Quest contract.
 
@@ -135,19 +142,19 @@ CRC parameters are polynomial `0x1021`, initial `0xFFFF`, no reflection, and no 
 | Request | Result |
 | --- | --- |
 | `GET /api/v2/health` | Short JSON diagnostic response, then close |
-| `GET /api/v2/live` | Long-lived chunked `application/octet-stream` AHSP/3 response |
+| `GET /api/v2/live` | Long-lived chunked `application/octet-stream` AHSP/4 response |
 
 Use simple GET requests: no body, custom headers, credentials, or query string. The header budget is 384 bytes and Pico uses a three-second request deadline. Exactly one live stream is supported. The Quest must own one reader, close it before another opens, and rely on `STATUS` rather than concurrent health checks.
 
 The health response is:
 
 ```json
-{"protocol":3,"streams":0,"accepted":0,"deduplicated":0,"malformed":0,"rejected":0}
+{"protocol":4,"streams":0,"accepted":0,"deduplicated":0,"malformed":0,"rejected":0}
 ```
 
 Development responses include `Access-Control-Allow-Origin: *`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. Before distribution, replace the wildcard with the exact Quest origin and design real TLS trust, MQTT security, and authorization. CORS is not authorization.
 
-## AHSP/3
+## AHSP/4
 
 Fetch read boundaries are arbitrary. A Quest parser must accumulate bytes and parse frames itself; it must not use `ReadableStream` reads or HTTP chunks as frame boundaries.
 
@@ -155,7 +162,7 @@ All multibyte integers are unsigned big-endian:
 
 ```text
 0..1   magic = 0xA7DB
-2      protocol version = 3
+2      protocol version = 4
 3      frame type
 4..7   frame sequence:u32
 8..11  device serialization time from millis():u32
@@ -193,12 +200,12 @@ stream ID:u8 | visual type:u8 | expected payload bytes:u16 | name length:u8 | UT
 `BASELINE` and `DELTA` body:
 
 ```text
-sample count:u8 | repeated(stream ID:u8 | sample age:u16 ms | payload length:u8 | application bytes)
+sample count:u8 | repeated(stream ID:u8 | sample age:u16 ms | payload length:u16 | application bytes)
 ```
 
-An expected payload size of zero means variable length up to 64 bytes. Sample age saturates at `65535` ms. A missing stream means unavailable, never a zero measurement.
+An expected payload size of zero means variable length up to 256 bytes. Sample age saturates at `65535` ms. A missing stream means unavailable, never a zero measurement.
 
-AHSP/3 is latest-value delivery. Each registered stream has one fixed cache
+AHSP/4 is latest-value delivery. Each registered stream has one fixed cache
 slot; there is no queue, history, replay, or backfill. Valid byte-identical
 values are deduplicated. Faster updates overwrite intermediate values, and a
 delta contains the final changed value at most once every 100 ms. Put source
@@ -229,7 +236,7 @@ xxd -g 1 -l 256 /tmp/ardb-live.bin
 | `src/BrokerNetwork*` | AP/station startup and address reporting |
 | `src/HeadConfig.h` | Dynamic-registry capacity, limits, timing, CORS, paths |
 | `src/HeadTelemetry*` | Metadata registration, wildcard MQTT subscription, validation, cache, counters, ESP32 locking |
-| `src/HeadByteWriter.h`, `src/HeadProtocol*`, `src/HeadStreamSession*` | Shared transport-neutral AHSP/3 core |
+| `src/HeadByteWriter.h`, `src/HeadProtocol*`, `src/HeadStreamSession*` | Shared transport-neutral AHSP/4 core |
 | `src/HeadHttpsStreamPico.h`, `src/HeadHttpsStream.cpp`, `src/HeadSecureServer*` | Pico HTTPS adapter and backlog fix |
 | `src/HeadHttpsStreamEsp32*` | ESP32 native HTTPS adapter |
 

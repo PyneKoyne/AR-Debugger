@@ -35,7 +35,7 @@ class HeadTelemetry {
   size_t buildDefinitionBody(size_t definitionIndex, uint8_t* output,
                              size_t outputCapacity) const;
   // Encodes one entry used by both BASELINE and DELTA frame bodies:
-  // stream ID:u8 | sample age milliseconds:u16 BE | payload length:u8 |
+  // stream ID:u8 | sample age milliseconds:u16 BE | payload length:u16 BE |
   // application bytes.
   size_t buildSampleRecord(size_t streamIndex, uint8_t* output,
                            size_t outputCapacity) const;
@@ -44,7 +44,7 @@ class HeadTelemetry {
  private:
   struct SampleSlot {
     uint8_t payload[ardb_head::kMaxApplicationPayloadBytes];
-    uint8_t length;
+    uint16_t length;
     uint32_t receivedAtMs;
     bool valid;
   };

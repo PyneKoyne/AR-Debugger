@@ -1,7 +1,7 @@
 #pragma once
 
 // The public head-node interface is intentionally stable. Each supported
-// target selects an HTTPS transport adapter, while AHSP/3 session behavior is
+// target selects an HTTPS transport adapter, while AHSP/4 session behavior is
 // shared by HeadStreamSession.
 #if defined(ARDUINO_ARCH_RP2040)
 #include "HeadHttpsStreamPico.h"

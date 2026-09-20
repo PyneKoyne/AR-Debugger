@@ -25,10 +25,15 @@
 #include "hardware/pwm.h"
 #include "hardware/gpio.h"
 
-const char* WIFI_SSID = "Broker1";
-const char* WIFI_PASSWORD = "abcdefghi";
-const char* MQTT_HOST = "192.168.4.1";  // MQTT broker IP, not the Wi-Fi SSID
+const char* WIFI_SSID = "Duckweth";
+const char* WIFI_PASSWORD = "Vampire Hunters 3";
+const char* MQTT_HOST = "110.37.114.246";  // MQTT broker IP, not the Wi-Fi SSID
 const uint16_t MQTT_PORT = 1883;
+
+// Leave enabled while diagnosing Wi-Fi association. This only performs one
+// passive scan before the normal connection attempt; it does not publish,
+// connect to MQTT, or initialize the motor driver.
+#define ARDB_WIFI_DIAGNOSTICS 1
 
 WiFiClient network;
 
@@ -45,6 +50,39 @@ struct PwmState {
 void beginArdbNetwork(const char* ssid, const char* password) {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
+}
+
+void reportTargetNetworkVisibility() {
+#if ARDB_WIFI_DIAGNOSTICS
+  // A scan distinguishes "the AP is not reachable" from "the AP rejected the
+  // association." The Pico Wi-Fi core reports both as WL_CONNECT_FAILED.
+  WiFi.mode(WIFI_STA);
+  Serial.println("Scanning for configured Wi-Fi network...");
+  const int8_t networkCount = WiFi.scanNetworks();
+  if (networkCount < 0) {
+    Serial.println("Wi-Fi scan failed");
+    return;
+  }
+
+  bool found = false;
+  for (int8_t index = 0; index < networkCount; ++index) {
+    const char* discoveredSsid = WiFi.SSID(static_cast<uint8_t>(index));
+    if (discoveredSsid != nullptr && strcmp(discoveredSsid, WIFI_SSID) == 0) {
+      found = true;
+      Serial.print("Configured network visible: RSSI=");
+      Serial.print(WiFi.RSSI(static_cast<uint8_t>(index)));
+      Serial.print(" dBm channel=");
+      Serial.print(WiFi.channel(static_cast<uint8_t>(index)));
+      Serial.print(" security=");
+      Serial.println(WiFi.encryptionType(static_cast<uint8_t>(index)));
+    }
+  }
+  WiFi.scanDelete();
+
+  if (!found) {
+    Serial.println("Configured network was not visible in this scan");
+  }
+#endif
 }
 
 bool ardbNetworkConnected() {
@@ -105,14 +143,51 @@ static float sineVelocityTarget() {
   return direction * MAX_VELOCITY_RAD_S * sinf(phase);
 }
 
+void printArdbConnectionStatus() {
+  static uint32_t lastReportedAtMs = 0;
+  const uint32_t nowMs = millis();
+  if (nowMs - lastReportedAtMs < 2000) {
+    return;
+  }
+  lastReportedAtMs = nowMs;
+
+  const int wifiStatus = WiFi.status();
+  Serial.print("Wi-Fi status=");
+  Serial.print(wifiStatus);
+  if (wifiStatus == WL_CONNECTED) {
+    Serial.print(" ip=");
+    Serial.print(WiFi.localIP());
+  }
+  Serial.print(" ARDB state=");
+  Serial.print(static_cast<uint8_t>(ardb.state()));
+  Serial.print(" MQTT error=");
+  Serial.println(ardb.lastConnectError());
+}
+
+// Match the broker's station startup behavior exactly: block setup until the
+// Pico reports a completed Wi-Fi association, printing one progress dot every
+// 500 ms. Motor PWM is deliberately not configured before this returns.
+void waitForWifiBeforeMotor() {
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print('.');
+  }
+  Serial.println();
+
+  Serial.print("Wi-Fi connected; ip=");
+  Serial.println(WiFi.localIP());
+}
+
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
 
   // Start associating before the motor setup. The ARDB callbacks continue to
   // own retries after this initial request.
-  Serial.println("Starting Wi-Fi association with Broker1");
+  Serial.println("Starting Wi-Fi association");
+  reportTargetNetworkVisibility();
   beginArdbNetwork(WIFI_SSID, WIFI_PASSWORD);
+  waitForWifiBeforeMotor();
 
   driver.pwm_frequency = 32000;
   driver.voltage_power_supply = SUPPLY_VOLTAGE;
@@ -141,6 +216,7 @@ void setup() {
 
 void loop() {
   ardb.update();  // never loops until connected; call every iteration
+  printArdbConnectionStatus();
   static bool connectionReported = false;
   if (ardb.connected() && !connectionReported) {
     ardb.print(pwmTopic, "ARDB connected");  // text length is inferred

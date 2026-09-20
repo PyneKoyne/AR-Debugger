@@ -6,6 +6,7 @@
 #include "HeadConfig.h"
 #include "HeadHttpsStream.h"
 #include "HeadTelemetry.h"
+#include "LocalNetworkValidation.h"
 #include "TinyMqtt.h"
 
 namespace ardb_broker {
@@ -44,6 +45,7 @@ class Runtime final {
   MqttBroker broker_;
   HeadTelemetry telemetry_;
   HeadHttpsStream headHttps_;
+  LocalNetworkValidation localNetworkValidation_;
 };
 
 }  // namespace ardb_broker

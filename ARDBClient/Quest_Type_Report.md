@@ -17,13 +17,13 @@ by ARDB metadata.
 publisher: addTopic(topic, visual type, name, expected byte length)
     -> retained ARDB metadata v3 over MQTT
 broker/head: validates and stores the descriptor
-    -> AHSP/3 STREAM_DEFINITION(type, expected length, display name)
+    -> AHSP/4 STREAM_DEFINITION(type, expected length, display name)
 Quest: chooses a decoder from the type, then decodes application bytes in
        BASELINE/DELTA sample records
 ```
 
 The Quest receives the **application bytes only**. It does not receive the
-MQTT data-packet CRC; the head validates and removes it. Each AHSP/3 frame
+MQTT data-packet CRC; the head validates and removes it. Each AHSP/4 frame
 which carries the definition or sample has its own separate frame CRC.
 
 ## The visual types
@@ -156,14 +156,14 @@ last 2  CRC-16/CCITT-FALSE of every preceding metadata byte, big-endian u16
 ```
 
 An expected length of zero means variable length. Client registration rejects
-a fixed length greater than 64 bytes. It also rejects an empty topic/name,
+a fixed length greater than 256 bytes. It also rejects an empty topic/name,
 topic/name longer than 255 bytes, a conflicting duplicate topic, and a topic
 count beyond `ARDB_MAX_TOPICS` (8 by default).
 
 For this head implementation, keep the client metadata prefix at its default
 `ardb/meta`: the broker recognizes only MQTT topics beginning with
 `ardb/meta/`. The head further accepts only a topic up to 64 bytes, a display
-name up to 48 bytes, an expected length up to 64 bytes, and its configured
+name up to 48 bytes, an expected length up to 256 bytes, and its configured
 stream capacity (8 by default). A descriptor accepted by the client can
 therefore still be rejected by the head if it exceeds those tighter limits.
 
@@ -188,7 +188,7 @@ the MQTT CRC before creating a Quest sample. The low-level
 `publish(const char* topic, ...)` API does not register metadata, so the head
 rejects its data unless that same MQTT topic was already registered.
 
-Quest receives the retained stream definition through an AHSP/3
+Quest receives the retained stream definition through an AHSP/4
 `STREAM_DEFINITION` frame body:
 
 ```text
@@ -199,7 +199,7 @@ display-name length:u8 | display-name bytes
 The corresponding `BASELINE` and `DELTA` records are:
 
 ```text
-stream ID:u8 | sample age:u16 big-endian | payload length:u8 |
+stream ID:u8 | sample age:u16 big-endian | payload length:u16 big-endian |
 application bytes
 ```
 
@@ -217,11 +217,11 @@ it needs ordering or loss detection.
 
 ## Quest implementation checklist
 
-1. Parse and CRC-check AHSP/3 frames independently of Fetch read boundaries.
+1. Parse and CRC-check AHSP/4 frames independently of Fetch read boundaries.
 2. Upsert a stream definition by its head-supplied stream ID; retain its type,
    expected length, and display name.
 3. For each baseline/delta record, require that the record's payload length is
-   at most 64 and matches a nonzero expected length before decoding.
+   at most 256 and matches a nonzero expected length before decoding.
 4. Select a decoder from `visualType`, but make each numeric decoder depend on
    an agreed application schema. Use `DataView` with the schema's explicit
    endianness rather than relying on a JavaScript typed-array default.
