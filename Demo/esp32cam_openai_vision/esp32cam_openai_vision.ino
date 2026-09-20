@@ -19,6 +19,7 @@
  */
 
 #include "esp_camera.h"
+#include "img_converters.h"   // jpg2rgb565 / fmt2jpg, for the ARDB thumbnail
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
@@ -639,6 +640,156 @@ static bool dispatchVision(camera_fb_t *fb) {
 #endif
 
 // ============================================================
+//  ARDB JPEG THUMBNAIL
+// ============================================================
+// The head caps a JPEG stream at 2,048 application bytes
+// (kMaxJpegApplicationPayloadBytes, ARDBBroker/src/HeadConfig.h) and
+// ARDBClient static_asserts the same bound. An HQVGA frame at JPEG_QUALITY 15
+// runs well past that, so the old "skip anything oversized" rule dropped most
+// frames and the viewer saw little or no video -- watch the img field in the
+// heartbeat to see the real sizes. Re-encode a copy that fits the budget
+// instead.
+//
+// The sensor's own quality is deliberately left alone: the SAME frame is
+// handed to OpenAI by dispatchVision(), and crushing it at the sensor would
+// cost real face-detection accuracy. This is a separate decode/re-encode of
+// that frame, so the vision path is untouched.
+//
+// The two quality scales run in OPPOSITE directions -- easy to get backwards:
+//   config.jpeg_quality (sensor)  0..63   LOWER  number = better = bigger
+//   fmt2jpg() quality             1..100  HIGHER number = better = bigger
+// Everything below is on the fmt2jpg scale.
+#if ENABLE_ARDB
+
+#define ARDB_JPEG_BUDGET ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES
+
+static const uint8_t THUMB_Q_MIN     = 8;
+static const uint8_t THUMB_Q_MAX     = 60;
+static const uint8_t THUMB_Q_STEP    = 8;
+static const uint8_t THUMB_SHIFT_MIN = 1;   // 1 = half size (240x176 -> 120x88)
+static const uint8_t THUMB_SHIFT_MAX = 3;   // 3 = eighth size
+static const int     THUMB_MAX_TRIES = 3;   // encodes per frame, worst case
+
+static uint8_t *thumbRgb    = nullptr;   // RGB565 scratch, reused every frame
+static size_t   thumbRgbCap = 0;
+static uint8_t  thumbQuality = 30;
+static uint8_t  thumbShift   = THUMB_SHIFT_MIN;
+static size_t   g_lastThumbLen = 0;      // for the stats line
+
+// The two halves of this pipeline disagree about RGB565 byte order, which is
+// what produced the scrambled-colour output:
+//
+//   jpg2rgb565()  hardcodes esp_jpeg's swap_color_bytes = 0, so esp_jpeg
+//                 writes dst[0] = LOBYTE, dst[1] = HIBYTE  -> LITTLE-endian
+//                 (esp_jpeg/jpeg_decoder.c, the JD_FORMAT==0 -> RGB565 branch)
+//   fmt2jpg()     defaults its private rgb565_big_endian flag to TRUE, so it
+//                 reads src[i] as the HIGH byte             -> BIG-endian
+//                 (esp32-camera/to_jpg.cpp, convert_line_format)
+//
+// Reading the pair backwards splits red and blue across the wrong byte, so
+// red decodes as blue-ish and blue as green-ish. Greys survive, which is why
+// the output looked like noise in colour rather than obviously inverted.
+//
+// jpgSetRgb565BE(false) switches fmt2jpg to the little-endian reader the
+// decoder actually produces. It is exported by the camera library but is
+// missing from the bundled img_converters.h, so declare it here. C linkage is
+// real, not assumed: the symbol is plain `T jpgSetRgb565BE` in
+// libespressif__esp32-camera.a. If that ever stops being true this fails at
+// link time, which is a safe way to fail.
+extern "C" void jpgSetRgb565BE(bool enable);
+
+// Call once before the first encodeThumb(). It sets a library-global used by
+// every fmt2jpg() RGB565 conversion; nothing else in this sketch calls one.
+static void thumbBegin() { jpgSetRgb565BE(false); }
+
+static esp_jpeg_image_scale_t thumbScaleFor(uint8_t shift) {
+  switch (shift) {
+    case 0:  return JPG_SCALE_NONE;
+    case 1:  return JPG_SCALE_2X;
+    case 2:  return JPG_SCALE_4X;
+    default: return JPG_SCALE_8X;
+  }
+}
+
+// Re-encodes fb to at most budget bytes. Returns a buffer the caller must
+// free(), or nullptr when nothing fit this frame. Quality and scale persist
+// across frames, so after the first couple of frames this costs one encode.
+static uint8_t *encodeThumb(camera_fb_t *fb, size_t budget, size_t *outLen) {
+  if (!fb || fb->format != PIXFORMAT_JPEG || !fb->width || !fb->height) {
+    return nullptr;
+  }
+
+  // Sized for the FULL frame rather than the scaled one: it is reused every
+  // frame anyway, and it stays correct if the decoder ever ignores the scale.
+  const size_t needed = (size_t)fb->width * (size_t)fb->height * 2;
+  if (thumbRgbCap < needed) {
+    free(thumbRgb);
+    thumbRgb = (uint8_t *)ps_malloc(needed);
+    thumbRgbCap = thumbRgb ? needed : 0;
+    if (!thumbRgb) {
+      Serial.println("[thumb] PSRAM alloc failed");
+      return nullptr;
+    }
+  }
+
+  // esp_jpeg lays the output out at width/scale_div, so the scale passed to the
+  // decoder and the dimensions handed to the encoder have to be the same shift
+  // or every row is read at the wrong stride. Back off to a shift that divides
+  // the frame exactly, and derive both from that one value.
+  uint8_t shift = thumbShift;
+  while (shift && ((fb->width % (1u << shift)) || (fb->height % (1u << shift)))) {
+    shift--;
+  }
+
+  if (!jpg2rgb565(fb->buf, fb->len, thumbRgb, thumbScaleFor(shift))) {
+    Serial.println("[thumb] decode failed");
+    return nullptr;
+  }
+
+  const uint16_t w = fb->width  >> shift;
+  const uint16_t h = fb->height >> shift;
+  if (!w || !h) return nullptr;
+
+  uint8_t q = thumbQuality;
+  for (int attempt = 0; attempt < THUMB_MAX_TRIES; attempt++) {
+    uint8_t *out = nullptr;
+    size_t   len = 0;
+    if (!fmt2jpg(thumbRgb, (size_t)w * h * 2, w, h, PIXFORMAT_RGB565, q, &out,
+                 &len)) {
+      Serial.println("[thumb] encode failed");
+      return nullptr;
+    }
+
+    if (len <= budget) {
+      thumbQuality = q;
+      // Well under budget: creep back toward fidelity one step per frame, so
+      // the size settles instead of oscillating.
+      if (len < budget / 2) {
+        if (thumbQuality < THUMB_Q_MAX) thumbQuality++;
+        else if (thumbShift > THUMB_SHIFT_MIN) thumbShift--;
+      }
+      *outLen = len;
+      return out;
+    }
+
+    free(out);
+    if (q <= THUMB_Q_MIN) break;          // quality floor; only fewer pixels help
+    q = (q > THUMB_Q_MIN + THUMB_Q_STEP) ? (uint8_t)(q - THUMB_Q_STEP)
+                                         : THUMB_Q_MIN;
+  }
+
+  // Nothing fit. Keep the harshest quality reached, and if even the floor was
+  // too big, halve the image again for the next frame.
+  thumbQuality = q;
+  if (q <= THUMB_Q_MIN && thumbShift < THUMB_SHIFT_MAX) {
+    thumbShift++;
+    Serial.printf("[thumb] dropping to 1/%u scale\n", 1u << thumbShift);
+  }
+  return nullptr;
+}
+#endif
+
+// ============================================================
 //  WI-FI  (owned by the sketch; ARDB only gets a status callback)
 // ============================================================
 // Disconnect reason codes worth knowing:
@@ -756,6 +907,9 @@ void setup() {
   wifiStart();
 
 #if ENABLE_ARDB
+  // Before any encodeThumb(): align fmt2jpg's RGB565 reader with the decoder.
+  thumbBegin();
+
   Serial.println("[boot] constructing ARDB");
   ardbTransport = new WiFiClient();
   ardbConfig    = new ARDBConfig(ARDBConfig::wifiMqtt(
@@ -837,6 +991,11 @@ void loop() {
                             ardb->lastConnectError(),
                             (unsigned long)ardb->sentPackets(),
                             (unsigned long)ardb->droppedPackets());
+    // Thumbnail tuning: img is the last published size against the budget,
+    // q/scale are where the adaptive search has settled.
+    Serial.printf(" img %u/%u q%u 1/%u", (unsigned)g_lastThumbLen,
+                  (unsigned)ARDB_JPEG_BUDGET, (unsigned)thumbQuality,
+                  1u << thumbShift);
 #endif
     Serial.println();
   }
@@ -880,10 +1039,20 @@ void loop() {
 
 #if ENABLE_ARDB
   if (ardbReady && ardb && ardb->connected()) {
-    // A too-large image is deliberately skipped rather than truncated or sent
-    // as an invalid ARDB frame. The client enforces the same bound.
-    if (fb->len <= ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES) {
+    // Truncating a JPEG would produce an invalid frame, so an oversized one is
+    // re-encoded down to the budget rather than cut. Only a frame that cannot
+    // be made to fit at all is skipped.
+    if (fb->len <= ARDB_JPEG_BUDGET) {
+      g_lastThumbLen = fb->len;
       ardb->printBytes(tImage, fb->buf, fb->len);
+    } else {
+      size_t   thumbLen = 0;
+      uint8_t *thumb = encodeThumb(fb, ARDB_JPEG_BUDGET, &thumbLen);
+      if (thumb) {
+        g_lastThumbLen = thumbLen;
+        ardb->printBytes(tImage, thumb, thumbLen);
+        free(thumb);
+      }
     }
     ardb->print(tHuman, human);
 
