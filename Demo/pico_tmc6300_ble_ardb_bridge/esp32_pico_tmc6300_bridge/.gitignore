@@ -1,0 +1,2 @@
+# Contains local Wi-Fi and MQTT credentials.
+arduino_secrets.h

@@ -14,7 +14,9 @@
 
 #include <Arduino.h>
 #include <WiFi.h>
+#include <map>
 #include <string.h>
+#include <string>
 
 #include <BLEClient.h>
 #include <BLEDevice.h>
@@ -32,9 +34,11 @@ constexpr char kClientId[] = "esp32-pico-tmc6300-bridge";
 constexpr char kPicoServiceUuid[] = "a148b750-92c6-4f9a-9f61-a9f1d376adc1";
 constexpr char kPicoPwmCharacteristicUuid[] =
     "a148b751-92c6-4f9a-9f61-a9f1d376adc1";
+constexpr char kPicoDeviceName[] = "ARDB-PWM";
 constexpr char kPwmTopicPath[] = "b/demo/a";
 constexpr size_t kPwmPayloadBytes = 3 * sizeof(float);
 constexpr uint32_t kBleScanIntervalMs = 5000;
+constexpr uint16_t kWifiConnectTimeoutMs = 30000;
 
 static_assert(sizeof(float) == 4,
               "The Pico sends three 32-bit IEEE-754 float values.");
@@ -44,25 +48,50 @@ struct PwmPayload {
 };
 
 WiFiClient mqttTransport;
+bool wifiConfigured = false;
 
 void beginWifi(const char* ssid, const char* password) {
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  const wl_status_t status = WiFi.status();
+  if (status == WL_CONNECTED || status == WL_IDLE_STATUS) {
+    // WL_IDLE_STATUS means the station has associated and is still obtaining
+    // an IP address. Calling WiFi.begin() here causes ESP-IDF's "sta is
+    // connecting, cannot set config" error and restarts that work.
+    return;
+  }
+
+  if (!wifiConfigured) {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFi.begin(ssid, password);
+    wifiConfigured = true;
+  }
+
+  // ESP32's Wi-Fi driver reconnects automatically. Do not call WiFi.begin()
+  // or WiFi.reconnect() again here: either call can interrupt an association
+  // still in progress and emits "sta is connecting" errors.
 }
 
 bool wifiConnected() {
   return WiFi.status() == WL_CONNECTED;
 }
 
-ARDBConfig ardbConfig = ARDBConfig::wifiMqtt(
-    SECRET_WIFI_SSID, SECRET_WIFI_PASSWORD, SECRET_MQTT_HOST, kClientId,
-    SECRET_MQTT_PORT, /*retrySeconds=*/5, /*enabled=*/true);
+ARDBConfig makeArdbConfig() {
+  ARDBConfig config = ARDBConfig::wifiMqtt(
+      SECRET_WIFI_SSID, SECRET_WIFI_PASSWORD, SECRET_MQTT_HOST, kClientId,
+      SECRET_MQTT_PORT, /*retrySeconds=*/5, /*enabled=*/true);
+  config.wifiConnectTimeoutMs = kWifiConnectTimeoutMs;
+  return config;
+}
+
+ARDBConfig ardbConfig = makeArdbConfig();
 ARDBNetworkCallbacks ardbNetwork(beginWifi, wifiConnected);
 ARDBClient ardb(mqttTransport, ardbNetwork, ardbConfig);
 ARDBTopic pwmTopic;
 
 QueueHandle_t receivedPwm = nullptr;
 portMUX_TYPE bleStateLock = portMUX_INITIALIZER_UNLOCKED;
+volatile uint32_t receivedPwmCount = 0;
+uint32_t publishedPwmCount = 0;
 
 BLEScan* scanner = nullptr;
 BLEClient* picoClient = nullptr;
@@ -81,10 +110,32 @@ void onPicoPwmNotification(BLERemoteCharacteristic*, uint8_t* data,
 
   PwmPayload payload{};
   memcpy(payload.bytes, data, sizeof(payload.bytes));
+  ++receivedPwmCount;
 
   // The only queued value is replaced so the broker receives the newest PWM
   // sample after a short Wi-Fi/MQTT outage rather than a stale backlog.
   xQueueOverwrite(receivedPwm, &payload);
+}
+
+const char* wifiStatusName(wl_status_t status) {
+  switch (status) {
+    case WL_CONNECTED:
+      return "connected";
+    case WL_IDLE_STATUS:
+      return "joining/DHCP";
+    case WL_NO_SSID_AVAIL:
+      return "SSID not found";
+    case WL_CONNECT_FAILED:
+      return "authentication failed";
+    case WL_CONNECTION_LOST:
+      return "connection lost";
+    case WL_DISCONNECTED:
+      return "disconnected";
+    case WL_STOPPED:
+      return "stopped";
+    default:
+      return "unknown";
+  }
 }
 
 class PicoClientCallbacks final : public BLEClientCallbacks {
@@ -110,8 +161,13 @@ void onScanComplete(BLEScanResults) {
 class PicoAdvertisementCallbacks final : public BLEAdvertisedDeviceCallbacks {
  public:
   void onResult(BLEAdvertisedDevice advertisedDevice) override {
-    if (!advertisedDevice.haveServiceUUID() ||
-        !advertisedDevice.isAdvertisingService(BLEUUID(kPicoServiceUuid))) {
+    const bool hasExpectedService =
+        advertisedDevice.haveServiceUUID() &&
+        advertisedDevice.isAdvertisingService(BLEUUID(kPicoServiceUuid));
+    const bool hasExpectedName =
+        advertisedDevice.haveName() &&
+        strcmp(advertisedDevice.getName().c_str(), kPicoDeviceName) == 0;
+    if (!hasExpectedService && !hasExpectedName) {
       return;
     }
 
@@ -128,6 +184,9 @@ class PicoAdvertisementCallbacks final : public BLEAdvertisedDeviceCallbacks {
 
     delete candidate;
     if (accepted) {
+      Serial.println(hasExpectedService
+                         ? "[ble] found Pico PWM service"
+                         : "[ble] found Pico by name; checking its service");
       scanner->stop();
     }
   }
@@ -147,20 +206,51 @@ bool connectToPico(BLEAdvertisedDevice* device) {
   }
 
   if (!picoClient->connect(device)) {
+    Serial.println("[ble] Pico connection attempt failed");
     return false;
   }
 
   // The 12-byte payload works at the default 23-byte ATT MTU. A larger MTU
   // is not required, so this bridge remains compatible with the Pico default.
   BLERemoteService* service = picoClient->getService(BLEUUID(kPicoServiceUuid));
-  if (service == nullptr) {
-    picoClient->disconnect();
-    return false;
+  BLERemoteCharacteristic* characteristic = nullptr;
+  if (service != nullptr) {
+    characteristic =
+        service->getCharacteristic(BLEUUID(kPicoPwmCharacteristicUuid));
   }
 
-  BLERemoteCharacteristic* characteristic =
-      service->getCharacteristic(BLEUUID(kPicoPwmCharacteristicUuid));
   if (characteristic == nullptr || !characteristic->canNotify()) {
+    // The ESP32 has not matched the Pico service UUID during discovery. We
+    // already require the exact ARDB-PWM device name, then select only a
+    // notification characteristic; the callback still rejects every payload
+    // except the required 12-byte PWM sample.
+    Serial.println("[ble] locating Pico PWM notification characteristic");
+    characteristic = nullptr;
+    std::map<std::string, BLERemoteService*>* services = picoClient->getServices();
+    for (const auto& serviceEntry : *services) {
+      BLERemoteService* candidateService = serviceEntry.second;
+      if (candidateService == nullptr) {
+        continue;
+      }
+      std::map<std::string, BLERemoteCharacteristic*>* characteristics =
+          candidateService->getCharacteristics();
+      for (const auto& characteristicEntry : *characteristics) {
+        BLERemoteCharacteristic* candidate = characteristicEntry.second;
+        if (candidate != nullptr && candidate->canNotify()) {
+          characteristic = candidate;
+          Serial.print("[ble] using Pico notify characteristic ");
+          Serial.println(candidate->getUUID().toString().c_str());
+          break;
+        }
+      }
+      if (characteristic != nullptr) {
+        break;
+      }
+    }
+  }
+
+  if (characteristic == nullptr || !characteristic->canNotify()) {
+    Serial.println("[ble] Pico has no usable PWM notification characteristic");
     picoClient->disconnect();
     return false;
   }
@@ -202,6 +292,7 @@ void serviceBle() {
   }
   portEXIT_CRITICAL(&bleStateLock);
   if (beginScan) {
+    Serial.println("[ble] scanning for ARDB-PWM");
     const bool started = scanner->start(/*durationSeconds=*/4, onScanComplete,
                                         /*isContinue=*/false);
     if (!started) {
@@ -227,13 +318,37 @@ void publishPwm() {
   // sample until it is accepted by the MQTT transport.
   if (ardb.printBytes(pwmTopic, payload.bytes, sizeof(payload.bytes))) {
     xQueueReceive(receivedPwm, &payload, 0);
+    ++publishedPwmCount;
   }
+}
+
+void reportBridgeStatus() {
+  static uint32_t lastReportedAtMs = 0;
+  const uint32_t nowMs = millis();
+  if (nowMs - lastReportedAtMs < 2000) {
+    return;
+  }
+  lastReportedAtMs = nowMs;
+
+  Serial.print("[status] Wi-Fi=");
+  Serial.print(wifiStatusName(WiFi.status()));
+  Serial.print(" MQTT=");
+  Serial.print(ardb.connected() ? "connected" : "waiting");
+  Serial.print(" BLE=");
+  Serial.print(bleConnected ? "connected" : "scanning");
+  Serial.print(" BLE samples=");
+  Serial.print(receivedPwmCount);
+  Serial.print(" MQTT samples=");
+  Serial.println(publishedPwmCount);
 }
 
 }  // namespace
 
 void setup() {
   Serial.begin(115200);
+  delay(250);
+  Serial.println();
+  Serial.println("[boot] starting Pico TMC6300 BLE-to-ARDB bridge");
 
   receivedPwm = xQueueCreate(/*queueLength=*/1, sizeof(PwmPayload));
   if (receivedPwm == nullptr) {
@@ -245,6 +360,7 @@ void setup() {
                            "Demo BLDC PWM", kPwmPayloadBytes);
   ardb.begin();
 
+  Serial.println("[boot] starting BLE scanner");
   BLEDevice::init("ardb-pico-tmc6300");
   scanner = BLEDevice::getScan();
   scanner->setAdvertisedDeviceCallbacks(new PicoAdvertisementCallbacks());
@@ -260,5 +376,6 @@ void loop() {
   ardb.update();
   serviceBle();
   publishPwm();
+  reportBridgeStatus();
   delay(2);
 }
