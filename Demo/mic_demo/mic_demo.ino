@@ -61,15 +61,17 @@
  *           Plot as a 64-bucket bar chart, or as one column of a scrolling
  *           spectrogram heatmap.
  *
- *  m/aud/b  THREE_NUM (12 B) three float32 in order:
- *             [0] bass   dBFS   60 - 250 Hz
- *             [1] mid    dBFS   250 - 2000 Hz
- *             [2] treble dBFS   2000 - 8000 Hz
+ *  Only the spectrum and the log are published. Bass/mid/treble band levels,
+ *  the interpolated peak frequency and the broadband RMS level are all still
+ *  computed and printed to Serial, but they are not streamed: the first two
+ *  are derivable from the spectrum, and the head's 8-stream budget is shared
+ *  across every publisher on the broker, so a slot is worth more.
  *
- *  m/aud/p  ScalarF32 (4 B) float32 peak frequency in Hz, parabolically
- *           interpolated. 0.0 when the block is below the noise floor.
- *
- *  m/aud/v  ScalarF32 (4 B) float32 broadband RMS level in dBFS.
+ *  Note the peak frequency is the one value NOT fully recoverable from the
+ *  published spectrum. It is interpolated across 31.25 Hz bins, whereas the
+ *  top spectrum bands are up to 19 bins (594 Hz) wide. If you need precise
+ *  pitch on the Quest side rather than in the serial log, re-add it as a
+ *  ScalarF32 stream.
  *
  *  m/aud/l  Log (variable) UTF-8 status text, no trailing NUL, <= 64 bytes.
  * ---------------------------------------------------------------------------
@@ -105,21 +107,18 @@ const char* ARDB_CLIENT_ID = "demo-mic-01";
 
 // I2S pins. GPIO 6-11 are wired to the SPI flash on the classic ESP32, so the
 // 11/15/10 assignment only works on the ESP32-S3/S2.
-#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32S2)
 #define I2S_SCK 11  // mic SCK / BCLK
 #define I2S_WS  15  // mic WS / LRCL
 #define I2S_SD  10  // mic SD / DOUT
-#else
-#define I2S_SCK 26
-#define I2S_WS  25
-#define I2S_SD  33
-#endif
 #define I2S_PORT I2S_NUM_0
 
 // FFT configuration. samples must be a power of two.
+// Single precision throughout: the ESP32's FPU is single-precision only, so
+// every double operation is emulated in software. Running the FFT in float
+// keeps it on the hardware FPU and halves the working set.
 const uint16_t samples = 512;
-const double samplingFrequency = 16000.0;
-const double binHz = samplingFrequency / samples;  // 31.25 Hz
+const float samplingFrequency = 16000.0f;
+const float binHz = samplingFrequency / samples;  // 31.25 Hz
 
 // Spectrum band layout. 64 bands x 1 byte = the 64-byte payload ceiling.
 const uint8_t kBandCount = 64;
@@ -136,8 +135,9 @@ const float kAttack = 0.65f;
 const float kDecay = 0.25f;
 
 // A 24-bit left-justified sample in a 32-bit I2S word: >> 8 recovers the
-// signed 24-bit value, and 2^23 is its full scale.
-const double kFullScale24 = 8388608.0;
+// signed 24-bit value, and 2^23 is its full scale. Stored as a reciprocal so
+// the per-sample conversion is a multiply rather than a divide.
+const float kInvFullScale24 = 1.0f / 8388608.0f;
 
 const uint32_t SERIAL_PLOT_PERIOD_MS = 200;
 const uint32_t HEARTBEAT_PERIOD_MS = 5000;
@@ -153,13 +153,13 @@ const uint32_t REBOOT_AFTER_MS = 180000;        // nothing sent at all -> reboot
 // ============================================================
 //  BUFFERS  (globals, not stack: loopTask has an 8 KB stack by default)
 // ============================================================
-double vReal[samples];
-double vImag[samples];
+static float vReal[samples];
+static float vImag[samples];
 static int32_t sampleBuffer[samples];
 static float amp[samples / 2];
 
-ArduinoFFT<double> FFT =
-    ArduinoFFT<double>(vReal, vImag, samples, samplingFrequency);
+ArduinoFFT<float> FFT =
+    ArduinoFFT<float>(vReal, vImag, samples, samplingFrequency);
 
 // Band -> FFT bin mapping, built once in setup().
 static uint16_t bandBinLo[kBandCount];
@@ -187,10 +187,7 @@ static ARDBClient* ardb = nullptr;
 static bool wifiIsConnected() { return WiFi.status() == WL_CONNECTED; }
 
 static ARDBTopic tSpectrum;  // 1
-static ARDBTopic tBands;     // 2
-static ARDBTopic tPeak;      // 3
-static ARDBTopic tLevel;     // 4
-static ARDBTopic tLog;       // 5
+static ARDBTopic tLog;       // 2
 static bool ardbReady = false;
 #endif
 
@@ -467,21 +464,14 @@ void setup() {
                         /* dataPublishRateHz */ 10);
 
   Serial.println(F("[boot] registering topics"));
-  // Registration order fixes the metadata ids ardb/meta/<clientId>/1..5.
+  // Registration order fixes the metadata ids ardb/meta/<clientId>/1..2.
   // Keep it stable; clear retained metadata if a topic is renamed.
   // Display names must stay <= 48 bytes or the head rejects the descriptor.
   tSpectrum = ardb->addTopic("m/aud/s", ARDBVisualType::Binary,
                              "Audio spectrum 64 bands 62Hz-8kHz", kBandCount);
-  tBands = ardb->addTopic("m/aud/b", ARDBVisualType::THREE_NUM,
-                          "Bass / Mid / Treble dBFS", 12);
-  tPeak = ardb->addTopic("m/aud/p", ARDBVisualType::ScalarF32,
-                         "Peak frequency Hz", 4);
-  tLevel = ardb->addTopic("m/aud/v", ARDBVisualType::ScalarF32,
-                          "Level dBFS RMS", 4);
   tLog = ardb->addTopic("m/aud/l", ARDBVisualType::Log, "Mic demo log");
 
-  if (!tSpectrum.valid() || !tBands.valid() || !tPeak.valid() ||
-      !tLevel.valid() || !tLog.valid()) {
+  if (!tSpectrum.valid() || !tLog.valid()) {
     Serial.println(F("[ardb] FATAL: topic registration rejected"));
   }
 
@@ -530,10 +520,10 @@ void loop() {
 
   if ((int32_t)(millis() - nextHeartbeat) >= 0) {
     nextHeartbeat = millis() + HEARTBEAT_PERIOD_MS;
-    Serial.printf("[hb] up %lus heap %u/%u wifi %d rssi %d",
+    Serial.printf("[hb] up %lus heap %u/%u wifi %d rssi %d level %.1fdBFS",
                   (unsigned long)(millis() / 1000),
                   (unsigned)ESP.getFreeHeap(), (unsigned)ESP.getMaxAllocHeap(),
-                  (int)WiFi.status(), (int)WiFi.RSSI());
+                  (int)WiFi.status(), (int)WiFi.RSSI(), lastLevelDb);
 #if ENABLE_ARDB
     if (ardb) {
       Serial.printf(" ardb %d (state %d, err %d, sent %lu, dropped %lu)",
@@ -561,22 +551,25 @@ void loop() {
       // I2S MEMS mics carry a large DC bias. Windowing a biased signal smears
       // it across the low bins, which is why the original had to discard bins
       // 0 and 1. Subtracting the block mean fixes it at the source.
-      double sum = 0.0;
+      // The mean is accumulated in int64 over the raw counts, which is exact.
+      // A float accumulator would lose precision against a large DC bias,
+      // which is the very thing being measured.
+      int64_t rawSum = 0;
       for (uint16_t i = 0; i < samples; i++) {
-        const int32_t s24 = sampleBuffer[i] >> 8;  // 24-bit left-justified
-        const double v = (double)s24 / kFullScale24;
-        vReal[i] = v;
-        sum += v;
+        rawSum += (sampleBuffer[i] >> 8);  // 24-bit left-justified
       }
-      const double mean = sum / samples;
+      const float meanCounts = (float)rawSum / (float)samples;
 
-      double sumSq = 0.0;
+      // Subtract in counts, then normalise to +/-1.0 full scale.
+      float sumSq = 0.0f;
       for (uint16_t i = 0; i < samples; i++) {
-        vReal[i] -= mean;
-        vImag[i] = 0.0;
-        sumSq += vReal[i] * vReal[i];
+        const float centred =
+            ((float)(sampleBuffer[i] >> 8) - meanCounts) * kInvFullScale24;
+        vReal[i] = centred;
+        vImag[i] = 0.0f;
+        sumSq += centred * centred;
       }
-      lastLevelDb = amplitudeToDb((float)sqrt(sumSq / samples));
+      lastLevelDb = amplitudeToDb(sqrtf(sumSq / samples));
 
       // --- 2. FFT --------------------------------------------------------
       // Hann reads better than Hamming for a display spectrum: lower
@@ -591,7 +584,7 @@ void loop() {
       // full-scale sine read 0 dBFS.
       const float ampScale = 4.0f / (float)samples;
       for (uint16_t b = 0; b < samples / 2; b++) {
-        amp[b] = (float)vReal[b] * ampScale;
+        amp[b] = vReal[b] * ampScale;
       }
 
       // --- 4. Fold bins into the 64 bands --------------------------------
@@ -604,10 +597,10 @@ void loop() {
       }
 
       // --- 5. Lumped bass / mid / treble ---------------------------------
-      const uint16_t bassLo = 2;                          //   62.5 Hz
-      const uint16_t bassHi = (uint16_t)(250.0 / binHz);  //  250 Hz
-      const uint16_t midHi = (uint16_t)(2000.0 / binHz);  // 2000 Hz
-      const uint16_t trebleHi = samples / 2;              // 8000 Hz
+      const uint16_t bassLo = 2;                           //   62.5 Hz
+      const uint16_t bassHi = (uint16_t)(250.0f / binHz);  //  250 Hz
+      const uint16_t midHi = (uint16_t)(2000.0f / binHz);  // 2000 Hz
+      const uint16_t trebleHi = samples / 2;               // 8000 Hz
       lastBass = amplitudeToDb(bandAmplitude(amp, bassLo, bassHi));
       lastMid = amplitudeToDb(bandAmplitude(amp, bassHi, midHi));
       lastTreble = amplitudeToDb(bandAmplitude(amp, midHi, trebleHi));
@@ -626,24 +619,16 @@ void loop() {
         const float denom = a - 2.0f * b + c;
         const float delta =
             (fabsf(denom) < 1e-12f) ? 0.0f : 0.5f * (a - c) / denom;
-        lastPeakHz = ((float)peakBin + delta) * (float)binHz;
+        lastPeakHz = ((float)peakBin + delta) * binHz;
       } else {
-        lastPeakHz = (float)peakBin * (float)binHz;
+        lastPeakHz = (float)peakBin * binHz;
       }
 
       // --- 7. Publish ----------------------------------------------------
 #if ENABLE_ARDB
       if (ardbReady && ardb && ardb->connected()) {
         // The typed array overload infers sizeof(spectrumPayload) == 64.
-        bool anySent = ardb->print(tSpectrum, spectrumPayload);
-
-        const float bands[3] = {lastBass, lastMid, lastTreble};
-        anySent |= ardb->print(tBands, bands);  // 3 * 4 = 12 bytes
-
-        // Must be float, not double: a double would be 8 bytes and fail the
-        // 4-byte length check.
-        anySent |= ardb->print(tPeak, lastPeakHz);
-        anySent |= ardb->print(tLevel, lastLevelDb);
+        const bool anySent = ardb->print(tSpectrum, spectrumPayload);
 
         // Feeds netSupervisor(). Rate-limited calls return false, so this
         // only advances when bytes really reached the broker.
