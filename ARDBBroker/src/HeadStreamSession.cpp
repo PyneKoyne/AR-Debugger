@@ -9,6 +9,7 @@ HeadStreamSession::HeadStreamSession(HeadTelemetry& telemetry)
       lastStatusAtMs_(0),
       observedRegistryGeneration_(0),
       lastSentPayloads_{},
+      lastSentJpegPayload_{},
       lastSentPayloadLengths_{},
       lastSentValuesValid_{},
       pendingRecordOffsets_{},
@@ -16,6 +17,7 @@ HeadStreamSession::HeadStreamSession(HeadTelemetry& telemetry)
 
 bool HeadStreamSession::begin(HeadByteWriter& writer, uint32_t nowMs) {
   memset(lastSentPayloads_, 0, sizeof(lastSentPayloads_));
+  memset(lastSentJpegPayload_, 0, sizeof(lastSentJpegPayload_));
   memset(lastSentPayloadLengths_, 0, sizeof(lastSentPayloadLengths_));
   memset(lastSentValuesValid_, 0, sizeof(lastSentValuesValid_));
   lastDeltaAtMs_ = nowMs;
@@ -107,7 +109,7 @@ bool HeadStreamSession::sendSampleBatch(HeadByteWriter& writer,
     for (size_t index = 0; index < streamCount; ++index) {
       if (!telemetry_.hasSample(index) ||
           (lastSentValuesValid_[index] &&
-           telemetry_.samplePayloadEquals(index, lastSentPayloads_[index],
+           telemetry_.samplePayloadEquals(index, lastSentPayload(index),
                                           lastSentPayloadLengths_[index]))) {
         continue;
       }
@@ -152,7 +154,7 @@ bool HeadStreamSession::sendSampleBatch(HeadByteWriter& writer,
           static_cast<uint16_t>(body[offset + kSamplePayloadLengthOffset] << 8) |
           static_cast<uint16_t>(body[offset + kSamplePayloadLengthOffset + 1]);
       if (payloadLength != 0) {
-        memcpy(lastSentPayloads_[index], &body[offset + kSamplePayloadOffset],
+        memcpy(lastSentPayload(index), &body[offset + kSamplePayloadOffset],
                payloadLength);
       }
       lastSentPayloadLengths_[index] = payloadLength;
@@ -178,12 +180,22 @@ bool HeadStreamSession::hasUnsentSamples() const {
   for (size_t index = 0; index < telemetry_.streamCount(); ++index) {
     if (telemetry_.hasSample(index) &&
         (!lastSentValuesValid_[index] ||
-         !telemetry_.samplePayloadEquals(index, lastSentPayloads_[index],
+         !telemetry_.samplePayloadEquals(index, lastSentPayload(index),
                                          lastSentPayloadLengths_[index]))) {
       return true;
     }
   }
   return false;
+}
+
+const uint8_t* HeadStreamSession::lastSentPayload(size_t streamIndex) const {
+  return telemetry_.isJpegStream(streamIndex) ? lastSentJpegPayload_
+                                               : lastSentPayloads_[streamIndex];
+}
+
+uint8_t* HeadStreamSession::lastSentPayload(size_t streamIndex) {
+  return telemetry_.isJpegStream(streamIndex) ? lastSentJpegPayload_
+                                               : lastSentPayloads_[streamIndex];
 }
 
 bool HeadStreamSession::isDue(uint32_t nowMs, uint32_t targetMs) {

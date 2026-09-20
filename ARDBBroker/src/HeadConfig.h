@@ -22,16 +22,20 @@ constexpr uint32_t kStatusPeriodMs = 5000;
 constexpr uint32_t kRequestTimeoutMs = 3000;
 constexpr uint32_t kTlsCloseFlushTimeoutMs = 20;
 
-constexpr size_t kMaxApplicationPayloadBytes = 256;
+// Ordinary telemetry is capped at 64 bytes. JPEG is the sole exception: the
+// image path may carry one 16-kilobit (2,048-byte) compressed image.
+constexpr size_t kMaxApplicationPayloadBytes = 64;
+constexpr size_t kMaxJpegApplicationPayloadBytes = 2048;
+constexpr uint8_t kJpegVisualType = 7;
 constexpr size_t kMaxDefinitionNameBytes = 48;
 constexpr size_t kMaxMqttTopicBytes = 64;
 // A sample frame has a one-byte count followed by a five-byte record header.
-// Keep enough body space for one maximum-sized application payload.
-constexpr size_t kMaxFrameBodyBytes = 512;
+// Keep enough body space for one maximum-sized JPEG application payload.
+constexpr size_t kMaxFrameBodyBytes = kMaxJpegApplicationPayloadBytes + 6;
 constexpr size_t kMaxHttpRequestBytes = 384;
 
-static_assert(kMaxFrameBodyBytes >= kMaxApplicationPayloadBytes + 6,
-              "frame body must hold a count and one maximum-sized sample");
+static_assert(kMaxFrameBodyBytes >= kMaxJpegApplicationPayloadBytes + 6,
+              "frame body must hold a count and one maximum-sized JPEG sample");
 
 // This is a development-only default for a read-only API with no credentials.
 // Set it to the exact HTTPS origin of the Quest application before distributing

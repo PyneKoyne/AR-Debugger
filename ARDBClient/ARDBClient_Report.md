@@ -143,6 +143,7 @@ and require an exact match. Then apply metadata-specific structural checks.
 | `Imu6I16` | 3 | six `int16_t` values (12 bytes) |
 | `Imu6I16T32` | 4 | `uint32_t` timestamp + six `int16_t` values (16 bytes) |
 | `Event` | 5 | application-defined bytes |
+| `Jpeg` | 7 | JPEG bitstream, variable up to 2,048 bytes |
 | `Binary` | 255 | application-defined bytes |
 
 The enum tells the Quest how to interpret a stream; ARDB does not serialize or

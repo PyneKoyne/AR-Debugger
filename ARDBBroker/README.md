@@ -106,12 +106,13 @@ Set `ARDB_HEAD_MAX_STREAMS` before including `ARDBBroker.h` to choose capacity:
 #include <ARDBBroker.h>
 ```
 
-Every stream slot, topic string, display name, and 256-byte latest-value cache
-is statically reserved. A descriptor that exceeds the configured count, topic
-limit (64 bytes), name limit (48 bytes), or payload limit (256 bytes) is
-rejected. This is dynamic registration, not heap allocation. Stream IDs are
-stable until the broker restarts; after a restart, retained descriptors must be
-replayed before their data can be shown.
+Every stream slot, topic string, display name, and 64-byte ordinary
+latest-value cache is statically reserved. One separate 2,048-byte JPEG cache
+is reserved for the single permitted JPEG stream. A descriptor that exceeds the
+configured count, topic limit (64 bytes), name limit (48 bytes), or applicable
+payload limit is rejected. This is dynamic registration, not heap allocation.
+Stream IDs are stable until the broker restarts; after a restart, retained
+descriptors must be replayed before their data can be shown.
 
 Set a publisher's `ARDB_MAX_TOPICS` no higher than the broker capacity, or
 expect excess descriptors to be rejected. Retained metadata consumes one
@@ -125,7 +126,9 @@ topic length:u8 | display-name length:u8 | topic bytes | name bytes |
 CRC-16/CCITT-FALSE:u16 BE
 ```
 
-An expected payload size of zero permits variable payloads up to 256 bytes.
+An expected payload size of zero permits a variable payload up to 64 bytes, or
+up to 2,048 bytes for the `Jpeg` visual type. Only one JPEG descriptor is
+accepted at a time.
 The declared type, byte length, field order, units, scale, signedness, and byte
 order remain the publisher/Quest contract.
 
@@ -203,7 +206,9 @@ stream ID:u8 | visual type:u8 | expected payload bytes:u16 | name length:u8 | UT
 sample count:u8 | repeated(stream ID:u8 | sample age:u16 ms | payload length:u16 | application bytes)
 ```
 
-An expected payload size of zero means variable length up to 256 bytes. Sample age saturates at `65535` ms. A missing stream means unavailable, never a zero measurement.
+An expected payload size of zero means variable length up to 64 bytes, or up
+to 2,048 bytes for the one permitted `Jpeg` stream. Sample age saturates at
+`65535` ms. A missing stream means unavailable, never a zero measurement.
 
 AHSP/4 is latest-value delivery. Each registered stream has one fixed cache
 slot; there is no queue, history, replay, or backfill. Valid byte-identical

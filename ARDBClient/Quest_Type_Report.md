@@ -41,6 +41,7 @@ length check; it is not additional type validation by the client or head.
 | `Imu6I16T32` (`4`) | Six signed 16-bit IMU values plus a 32-bit source timestamp. | Fixed: `16`. | The included minimal publisher example uses the order `timeMs`, `ax`, `ay`, `az`, `gx`, `gy`, `gz` in one packed 16-byte structure. That is the only in-repository example of this type; it is not enforced by `ARDBClient`. |
 | `Event` (`5`) | An application-defined event record. | Variable (`0`) unless the event schema has one fixed size. | ARDB gives event bytes no special treatment. Quest needs a separately versioned schema before it can decode the payload. |
 | `THREE_NUM` (`6`) | Three related numeric values. | Fixed: `12` when the agreed form is three 32-bit floats. | The TMC6300 example uses this type for three `float` PWM-duty values (`uh`, `vh`, `wh`) and sends 12 bytes. The enum itself does not require floats, their order, or their units. |
+| `Jpeg` (`7`) | A JPEG image bitstream. | Variable (`0`) up to 2,048 bytes. | The head permits one JPEG stream and forwards valid bytes unchanged. Quest must decode the JPEG only after checking its payload length. |
 | `Binary` (`255`) | Opaque application-defined bytes. | Variable (`0`) unless the binary format is fixed. | The head forwards valid bytes to Quest unchanged. The type carries no schema, MIME type, length prefix, or encoding. |
 
 ### Consequences for a Quest decoder
@@ -156,16 +157,18 @@ last 2  CRC-16/CCITT-FALSE of every preceding metadata byte, big-endian u16
 ```
 
 An expected length of zero means variable length. Client registration rejects
-a fixed length greater than 256 bytes. It also rejects an empty topic/name,
-topic/name longer than 255 bytes, a conflicting duplicate topic, and a topic
-count beyond `ARDB_MAX_TOPICS` (8 by default).
+a fixed length greater than 64 bytes, except `Jpeg`, which permits up to 2,048
+bytes. It also rejects an empty topic/name, topic/name longer than 255 bytes, a
+conflicting duplicate topic, and a topic count beyond `ARDB_MAX_TOPICS` (8 by
+default).
 
 For this head implementation, keep the client metadata prefix at its default
 `ardb/meta`: the broker recognizes only MQTT topics beginning with
 `ardb/meta/`. The head further accepts only a topic up to 64 bytes, a display
-name up to 48 bytes, an expected length up to 256 bytes, and its configured
-stream capacity (8 by default). A descriptor accepted by the client can
-therefore still be rejected by the head if it exceeds those tighter limits.
+name up to 48 bytes, an expected length up to 64 bytes (or 2,048 for one
+`Jpeg` stream), and its configured stream capacity (8 by default). A
+descriptor accepted by the client can therefore still be rejected by the head
+if it exceeds those tighter limits.
 
 The `ARDBTopic::id()` and the final metadata-topic component are publisher
 registration positions. They are not the identifier Quest should render
@@ -221,7 +224,8 @@ it needs ordering or loss detection.
 2. Upsert a stream definition by its head-supplied stream ID; retain its type,
    expected length, and display name.
 3. For each baseline/delta record, require that the record's payload length is
-   at most 256 and matches a nonzero expected length before decoding.
+   at most 64, or at most 2,048 when its stream type is `Jpeg`, and matches a
+   nonzero expected length before decoding.
 4. Select a decoder from `visualType`, but make each numeric decoder depend on
    an agreed application schema. Use `DataView` with the schema's explicit
    endianness rather than relying on a JavaScript typed-array default.

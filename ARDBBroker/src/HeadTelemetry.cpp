@@ -18,6 +18,8 @@ HeadTelemetry::HeadTelemetry(MqttBroker& broker)
     : broker_(broker),
       subscriber_(&broker_, "head-telemetry"),
       streams_{},
+      jpegSample_{},
+      jpegStreamIndex_(-1),
       streamCount_(0),
       generation_(0),
       registryGeneration_(0),
@@ -71,15 +73,25 @@ uint32_t HeadTelemetry::rejectedSamples() const {
 
 bool HeadTelemetry::hasSample(size_t streamIndex) const {
   HeadTelemetryLockGuard guard(lock_);
+  if (streamIndex >= streamCount_ || !streams_[streamIndex].registered) {
+    return false;
+  }
+  return isJpegVisualType(streams_[streamIndex].visualType)
+             ? jpegStreamIndex_ == static_cast<int>(streamIndex) &&
+                   jpegSample_.valid
+             : streams_[streamIndex].sample.valid;
+}
+
+bool HeadTelemetry::isJpegStream(size_t streamIndex) const {
+  HeadTelemetryLockGuard guard(lock_);
   return streamIndex < streamCount_ && streams_[streamIndex].registered &&
-         streams_[streamIndex].sample.valid;
+         isJpegVisualType(streams_[streamIndex].visualType);
 }
 
 bool HeadTelemetry::samplePayloadEquals(size_t streamIndex,
                                         const uint8_t* payload,
                                         size_t payloadLength) const {
-  if (payload == nullptr ||
-      payloadLength > ardb_head::kMaxApplicationPayloadBytes) {
+  if (payload == nullptr) {
     return false;
   }
 
@@ -88,7 +100,15 @@ bool HeadTelemetry::samplePayloadEquals(size_t streamIndex,
     return false;
   }
   const SampleSlot& sample = streams_[streamIndex].sample;
-  return sample.valid && sample.length == payloadLength &&
+  if (isJpegVisualType(streams_[streamIndex].visualType)) {
+    return jpegStreamIndex_ == static_cast<int>(streamIndex) &&
+           payloadLength <= ardb_head::kMaxJpegApplicationPayloadBytes &&
+           jpegSample_.valid && jpegSample_.length == payloadLength &&
+           (payloadLength == 0 ||
+            memcmp(jpegSample_.payload, payload, payloadLength) == 0);
+  }
+  return payloadLength <= ardb_head::kMaxApplicationPayloadBytes &&
+         sample.valid && sample.length == payloadLength &&
          (payloadLength == 0 ||
           memcmp(sample.payload, payload, payloadLength) == 0);
 }
@@ -133,20 +153,27 @@ size_t HeadTelemetry::buildSampleRecord(size_t streamIndex, uint8_t* output,
     return 0;
   }
   const StreamSlot& stream = streams_[streamIndex];
-  const SampleSlot& sample = stream.sample;
   constexpr size_t kSamplePrefixBytes = 5;
-  const size_t required = kSamplePrefixBytes + sample.length;
-  if (!sample.valid || outputCapacity < required) {
+  const bool jpeg = isJpegVisualType(stream.visualType);
+  const uint8_t* payload = jpeg ? jpegSample_.payload : stream.sample.payload;
+  const uint16_t length = jpeg ? jpegSample_.length : stream.sample.length;
+  const uint32_t receivedAtMs = jpeg ? jpegSample_.receivedAtMs
+                                     : stream.sample.receivedAtMs;
+  const bool valid = jpeg ? jpegStreamIndex_ == static_cast<int>(streamIndex) &&
+                                jpegSample_.valid
+                          : stream.sample.valid;
+  const size_t required = kSamplePrefixBytes + length;
+  if (!valid || outputCapacity < required) {
     return 0;
   }
 
-  const uint32_t ageMs = millis() - sample.receivedAtMs;
+  const uint32_t ageMs = millis() - receivedAtMs;
   output[0] = stream.id;
   writeU16(&output[1],
            ageMs > 0xffffUL ? 0xffffU : static_cast<uint16_t>(ageMs));
-  writeU16(&output[3], sample.length);
-  if (sample.length != 0) {
-    memcpy(&output[kSamplePrefixBytes], sample.payload, sample.length);
+  writeU16(&output[3], length);
+  if (length != 0) {
+    memcpy(&output[kSamplePrefixBytes], payload, length);
   }
   return required;
 }
@@ -161,7 +188,10 @@ size_t HeadTelemetry::buildStatusBody(uint8_t* output,
   HeadTelemetryLockGuard guard(lock_);
   uint8_t validStreams = 0;
   for (size_t index = 0; index < streamCount_; ++index) {
-    if (streams_[index].registered && streams_[index].sample.valid) {
+    if (streams_[index].registered &&
+        (isJpegVisualType(streams_[index].visualType)
+             ? jpegStreamIndex_ == static_cast<int>(index) && jpegSample_.valid
+             : streams_[index].sample.valid)) {
       ++validStreams;
     }
   }
@@ -218,11 +248,12 @@ void HeadTelemetry::ingestMetadata(const char* payload, size_t payloadLength) {
 
   const uint16_t expectedPayloadBytes =
       static_cast<uint16_t>(bytes[6] << 8) | static_cast<uint16_t>(bytes[7]);
+  const uint8_t visualType = bytes[5];
   const size_t topicLength = bytes[8];
   const size_t nameLength = bytes[9];
   const size_t requiredLength =
       kMetadataHeaderBytes + topicLength + nameLength + kChecksumBytes;
-  if (expectedPayloadBytes > ardb_head::kMaxApplicationPayloadBytes ||
+  if (expectedPayloadBytes > maxPayloadBytesFor(visualType) ||
       topicLength == 0 || topicLength > ardb_head::kMaxMqttTopicBytes ||
       nameLength == 0 || nameLength > ardb_head::kMaxDefinitionNameBytes ||
       payloadLength != requiredLength ||
@@ -241,6 +272,12 @@ void HeadTelemetry::ingestMetadata(const char* payload, size_t payloadLength) {
 
   HeadTelemetryLockGuard guard(lock_);
   int streamIndex = findStream(descriptorTopic);
+  const bool requestedJpeg = isJpegVisualType(visualType);
+  if (requestedJpeg && jpegStreamIndex_ >= 0 &&
+      jpegStreamIndex_ != streamIndex) {
+    ++rejectedSamples_;
+    return;
+  }
   if (streamIndex < 0) {
     if (streamCount_ >= ardb_head::kMaxStreams) {
       ++rejectedSamples_;
@@ -254,7 +291,7 @@ void HeadTelemetry::ingestMetadata(const char* payload, size_t payloadLength) {
   }
 
   StreamSlot& stream = streams_[static_cast<size_t>(streamIndex)];
-  const bool changed = stream.visualType != bytes[5] ||
+  const bool changed = stream.visualType != visualType ||
                        stream.expectedPayloadBytes != expectedPayloadBytes ||
                        strncmp(stream.displayName, descriptorName, nameLength) != 0 ||
                        stream.displayName[nameLength] != '\0';
@@ -262,13 +299,24 @@ void HeadTelemetry::ingestMetadata(const char* payload, size_t payloadLength) {
     return;
   }
 
+  const bool wasJpeg = isJpegVisualType(stream.visualType);
+  if (wasJpeg) {
+    memset(&jpegSample_, 0, sizeof(jpegSample_));
+    jpegStreamIndex_ = -1;
+  }
+
   memcpy(stream.topic, descriptorTopic, topicLength);
   stream.topic[topicLength] = '\0';
   memcpy(stream.displayName, descriptorName, nameLength);
   stream.displayName[nameLength] = '\0';
-  stream.visualType = bytes[5];
+  stream.visualType = visualType;
   stream.expectedPayloadBytes = expectedPayloadBytes;
-  stream.sample.valid = false;
+  if (requestedJpeg) {
+    memset(&jpegSample_, 0, sizeof(jpegSample_));
+    jpegStreamIndex_ = streamIndex;
+  } else {
+    stream.sample.valid = false;
+  }
   ++registryGeneration_;
 }
 
@@ -287,7 +335,7 @@ void HeadTelemetry::ingestSample(const Topic& topic, const char* payload,
 
   const size_t applicationLength = payloadLength - kChecksumBytes;
   StreamSlot& stream = streams_[static_cast<size_t>(streamIndex)];
-  if (applicationLength > ardb_head::kMaxApplicationPayloadBytes ||
+  if (applicationLength > maxPayloadBytesFor(stream.visualType) ||
       (stream.expectedPayloadBytes != 0 &&
        applicationLength != stream.expectedPayloadBytes)) {
     ++rejectedSamples_;
@@ -300,6 +348,33 @@ void HeadTelemetry::ingestSample(const Topic& topic, const char* payload,
       static_cast<uint16_t>(bytes[payloadLength - 1]);
   if (crc16Ccitt(bytes, applicationLength) != expectedCrc) {
     ++malformedSamples_;
+    return;
+  }
+
+  if (isJpegVisualType(stream.visualType)) {
+    if (jpegStreamIndex_ != streamIndex) {
+      ++rejectedSamples_;
+      return;
+    }
+
+    const bool isDuplicate =
+        jpegSample_.valid && jpegSample_.length == applicationLength &&
+        (applicationLength == 0 ||
+         memcmp(jpegSample_.payload, bytes, applicationLength) == 0);
+
+    ++acceptedSamples_;
+    jpegSample_.receivedAtMs = millis();
+    if (isDuplicate) {
+      ++deduplicatedSamples_;
+      return;
+    }
+
+    if (applicationLength != 0) {
+      memcpy(jpegSample_.payload, bytes, applicationLength);
+    }
+    jpegSample_.length = static_cast<uint16_t>(applicationLength);
+    jpegSample_.valid = true;
+    ++generation_;
     return;
   }
 
@@ -322,6 +397,16 @@ void HeadTelemetry::ingestSample(const Topic& topic, const char* payload,
   sample.length = static_cast<uint16_t>(applicationLength);
   sample.valid = true;
   ++generation_;
+}
+
+bool HeadTelemetry::isJpegVisualType(uint8_t visualType) {
+  return visualType == ardb_head::kJpegVisualType;
+}
+
+size_t HeadTelemetry::maxPayloadBytesFor(uint8_t visualType) {
+  return isJpegVisualType(visualType)
+             ? ardb_head::kMaxJpegApplicationPayloadBytes
+             : ardb_head::kMaxApplicationPayloadBytes;
 }
 
 int HeadTelemetry::findStream(const char* topic) const {

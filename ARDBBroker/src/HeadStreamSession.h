@@ -31,6 +31,8 @@ class HeadStreamSession {
                        uint32_t nowMs);
   bool sendStatus(HeadByteWriter& writer, uint32_t nowMs);
   bool hasUnsentSamples() const;
+  const uint8_t* lastSentPayload(size_t streamIndex) const;
+  uint8_t* lastSentPayload(size_t streamIndex);
   static bool isDue(uint32_t nowMs, uint32_t targetMs);
 
   HeadTelemetry& telemetry_;
@@ -40,6 +42,7 @@ class HeadStreamSession {
   uint32_t observedRegistryGeneration_;
   uint8_t lastSentPayloads_[ardb_head::kMaxStreams]
                            [ardb_head::kMaxApplicationPayloadBytes];
+  uint8_t lastSentJpegPayload_[ardb_head::kMaxJpegApplicationPayloadBytes];
   uint16_t lastSentPayloadLengths_[ardb_head::kMaxStreams];
   bool lastSentValuesValid_[ardb_head::kMaxStreams];
   uint16_t pendingRecordOffsets_[ardb_head::kMaxStreams];

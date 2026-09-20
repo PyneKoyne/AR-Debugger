@@ -13,9 +13,9 @@
 #include <WiFi.h>
 #include <ARDBClient.h>
 
-const char* WIFI_SSID = "Broker1";
-const char* WIFI_PASSWORD = "abcdefghi";
-const char* MQTT_HOST = "192.168.4.1";  // MQTT broker IP, not the Wi-Fi SSID
+const char* WIFI_SSID = "HackTheNorth";
+const char* WIFI_PASSWORD = "hackthenorth2026";
+const char* MQTT_HOST = "10.37.114.246";  // MQTT broker IP, not the Wi-Fi SSID
 const uint16_t MQTT_PORT = 1883;
 
 WiFiClient network;

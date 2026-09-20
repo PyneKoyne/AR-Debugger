@@ -26,6 +26,7 @@ class HeadTelemetry {
   uint32_t rejectedSamples() const;
 
   bool hasSample(size_t streamIndex) const;
+  bool isJpegStream(size_t streamIndex) const;
   bool samplePayloadEquals(size_t streamIndex, const uint8_t* payload,
                            size_t payloadLength) const;
 
@@ -49,6 +50,15 @@ class HeadTelemetry {
     bool valid;
   };
 
+  // JPEG storage is intentionally separate from ordinary stream slots. The
+  // head accepts at most one JPEG stream, avoiding a 2 KiB buffer per stream.
+  struct JpegSampleSlot {
+    uint8_t payload[ardb_head::kMaxJpegApplicationPayloadBytes];
+    uint16_t length;
+    uint32_t receivedAtMs;
+    bool valid;
+  };
+
   struct StreamSlot {
     char topic[ardb_head::kMaxMqttTopicBytes + 1];
     char displayName[ardb_head::kMaxDefinitionNameBytes + 1];
@@ -61,6 +71,8 @@ class HeadTelemetry {
 
   static void onMqttPublish(const MqttClient* source, const Topic& topic,
                             const char* payload, size_t payloadLength);
+  static bool isJpegVisualType(uint8_t visualType);
+  static size_t maxPayloadBytesFor(uint8_t visualType);
   void ingest(const Topic& topic, const char* payload, size_t payloadLength);
   void ingestMetadata(const char* payload, size_t payloadLength);
   void ingestSample(const Topic& topic, const char* payload,
@@ -75,6 +87,8 @@ class HeadTelemetry {
   MqttBroker& broker_;
   MqttClient subscriber_;
   StreamSlot streams_[ardb_head::kMaxStreams];
+  JpegSampleSlot jpegSample_;
+  int jpegStreamIndex_;
   size_t streamCount_;
   uint32_t generation_;
   uint32_t registryGeneration_;

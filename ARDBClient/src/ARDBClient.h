@@ -15,13 +15,20 @@
 #endif
 
 #ifndef ARDB_MAX_APPLICATION_PAYLOAD_BYTES
-#define ARDB_MAX_APPLICATION_PAYLOAD_BYTES 256
+#define ARDB_MAX_APPLICATION_PAYLOAD_BYTES 64
+#endif
+
+#ifndef ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES
+#define ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES 2048
 #endif
 
 static_assert(ARDB_MAX_TOPICS < 255, "ARDB_MAX_TOPICS must fit in an 8-bit topic id");
 static_assert(ARDB_MAX_APPLICATION_PAYLOAD_BYTES > 0 &&
-                  ARDB_MAX_APPLICATION_PAYLOAD_BYTES <= 256,
-              "ARDB_MAX_APPLICATION_PAYLOAD_BYTES cannot exceed the ARDB head limit");
+                  ARDB_MAX_APPLICATION_PAYLOAD_BYTES <= 64,
+              "ARDB_MAX_APPLICATION_PAYLOAD_BYTES cannot exceed the ordinary ARDB head limit");
+static_assert(ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES > 0 &&
+                  ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES <= 2048,
+              "ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES cannot exceed the ARDB JPEG head limit");
 
 // The Quest uses this value to choose how to decode a topic's binary payload.
 enum class ARDBVisualType : uint8_t {
@@ -32,6 +39,7 @@ enum class ARDBVisualType : uint8_t {
   Imu6I16T32 = 4,
   Event = 5,
   THREE_NUM = 6,
+  Jpeg = 7,
   Binary = 255
 };
 
@@ -154,7 +162,8 @@ class ARDBClient {
   // literals and global const character arrays are ideal; Arduino String is not.
   // A returned invalid handle means the descriptor could not be registered.
   // expectedPayloadBytes is the fixed application-byte length sent on this
-  // topic. Zero permits variable payloads up to
+  // topic. Zero permits variable payloads up to the applicable limit:
+  // ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES for Jpeg, otherwise
   // ARDB_MAX_APPLICATION_PAYLOAD_BYTES.
   ARDBTopic addTopic(const char* topic, ARDBVisualType type, const char* name,
                      uint16_t expectedPayloadBytes = 0);
@@ -223,6 +232,7 @@ class ARDBClient {
 
   static bool isDue(uint32_t now, uint32_t target);
   static bool hasText(const char* value);
+  static size_t maxPayloadBytesFor(ARDBVisualType type);
   static uint16_t crc16Ccitt(const void* data, size_t length);
   static uint16_t crc16CcittUpdate(uint16_t crc, const void* data, size_t length);
   static void writeCrc16BigEndian(uint16_t crc, uint8_t output[2]);

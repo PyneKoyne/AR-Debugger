@@ -25,10 +25,16 @@
 #include "hardware/pwm.h"
 #include "hardware/gpio.h"
 
-const char* WIFI_SSID = "Duckweth";
-const char* WIFI_PASSWORD = "Vampire Hunters 3";
-const char* MQTT_HOST = "110.37.114.246";  // MQTT broker IP, not the Wi-Fi SSID
+const char* WIFI_SSID = "HackTheNorth";
+const char* WIFI_PASSWORD = "hackthenorth2026";
+const char* MQTT_HOST = "10.37.114.246";  // MQTT broker IP, not the Wi-Fi SSID
 const uint16_t MQTT_PORT = 1883;
+
+// The RP2040 Wi-Fi core reports both an unseen AP and rejected credentials as
+// WL_CONNECT_FAILED.  Start a fresh association periodically instead of
+// waiting forever on the result of one failed WiFi.begin() call.
+constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000UL;
+constexpr uint32_t WIFI_STATUS_INTERVAL_MS = 2000UL;
 
 // Leave enabled while diagnosing Wi-Fi association. This only performs one
 // passive scan before the normal connection attempt; it does not publish,
@@ -49,7 +55,29 @@ struct PwmState {
 
 void beginArdbNetwork(const char* ssid, const char* password) {
   WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
+  // WiFi.begin() blocks for up to two core timeouts on the Pico.  That can
+  // starve the motor-control loop and, after a failed join, used to leave this
+  // sketch waiting permanently without issuing another association request.
+  WiFi.beginNoBlock(ssid, password);
+}
+
+const char* wifiStatusName(uint8_t status) {
+  switch (status) {
+    case WL_IDLE_STATUS:
+      return "idle/associating";
+    case WL_CONNECTED:
+      return "connected";
+    case WL_CONNECT_FAILED:
+      return "association or authentication failed";
+    case WL_CONNECTION_LOST:
+      return "connection lost";
+    case WL_DISCONNECTED:
+      return "disconnected";
+    case WL_NO_SHIELD:
+      return "Wi-Fi radio unavailable";
+    default:
+      return "unknown";
+  }
 }
 
 void reportTargetNetworkVisibility() {
@@ -164,15 +192,34 @@ void printArdbConnectionStatus() {
   Serial.println(ardb.lastConnectError());
 }
 
-// Match the broker's station startup behavior exactly: block setup until the
-// Pico reports a completed Wi-Fi association, printing one progress dot every
-// 500 ms. Motor PWM is deliberately not configured before this returns.
+// Keep motor PWM disabled until the station has an address.  Unlike the old
+// one-shot implementation, a failed association gets a new Wi-Fi request, so
+// a temporarily unavailable AP cannot leave setup stuck forever.
 void waitForWifiBeforeMotor() {
+  uint32_t lastAttemptAtMs = millis();
+  uint32_t lastStatusAtMs = 0;
+
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print('.');
+    const uint32_t nowMs = millis();
+    const uint8_t status = WiFi.status();
+
+    if (nowMs - lastStatusAtMs >= WIFI_STATUS_INTERVAL_MS) {
+      lastStatusAtMs = nowMs;
+      Serial.print("Wi-Fi status: ");
+      Serial.print(wifiStatusName(status));
+      Serial.print(" (");
+      Serial.print(status);
+      Serial.println(')');
+    }
+
+    if (nowMs - lastAttemptAtMs >= WIFI_RETRY_INTERVAL_MS) {
+      Serial.println("Retrying Wi-Fi association");
+      beginArdbNetwork(WIFI_SSID, WIFI_PASSWORD);
+      lastAttemptAtMs = nowMs;
+    }
+
+    delay(25);
   }
-  Serial.println();
 
   Serial.print("Wi-Fi connected; ip=");
   Serial.println(WiFi.localIP());
@@ -185,6 +232,7 @@ void setup() {
   // Start associating before the motor setup. The ARDB callbacks continue to
   // own retries after this initial request.
   Serial.println("Starting Wi-Fi association");
+  cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
   reportTargetNetworkVisibility();
   beginArdbNetwork(WIFI_SSID, WIFI_PASSWORD);
   waitForWifiBeforeMotor();

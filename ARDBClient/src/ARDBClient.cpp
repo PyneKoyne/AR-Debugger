@@ -57,6 +57,12 @@ uint8_t ARDBTopic::id() const {
   return valid() ? static_cast<uint8_t>(_index + 1) : 0;
 }
 
+size_t ARDBClient::maxPayloadBytesFor(ARDBVisualType type) {
+  return type == ARDBVisualType::Jpeg
+             ? ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES
+             : ARDB_MAX_APPLICATION_PAYLOAD_BYTES;
+}
+
 ARDBClient::ARDBClient(Client& network, const ARDBConfig& config,
                        uint16_t dataPublishRateHz)
     : ARDBClient(network, ARDBNetworkCallbacks(), config, dataPublishRateHz) {}
@@ -194,7 +200,7 @@ ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type,
                                uint16_t expectedPayloadBytes) {
   if (!hasText(topic) || !hasText(name) || strlen(topic) > 255 ||
       strlen(name) > 255 ||
-      expectedPayloadBytes > ARDB_MAX_APPLICATION_PAYLOAD_BYTES) {
+      expectedPayloadBytes > maxPayloadBytesFor(type)) {
     return ARDBTopic();
   }
 
@@ -251,7 +257,7 @@ bool ARDBClient::publish(const ARDBTopic& topic, const void* data, size_t length
   // record, whose implementation has a bounded latest-value cache. Refuse an
   // oversize variable payload locally instead of sending a packet the head
   // must reject. Direct publish(const char*, ...) remains MQTT interop.
-  if (length > ARDB_MAX_APPLICATION_PAYLOAD_BYTES) {
+  if (length > maxPayloadBytesFor(descriptor->type)) {
     return false;
   }
 
