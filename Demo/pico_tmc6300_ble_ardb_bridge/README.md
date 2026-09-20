@@ -13,7 +13,8 @@ The payload is the same one used by the former TMC6300 sketch: three 32-bit
 IEEE-754 floats, in order `UH`, `VH`, `WH`, each a percentage duty cycle. The
 ESP32 publishes those unchanged 12 bytes as `ARDBVisualType::THREE_NUM` on
 `b/demo/a`, named **Demo BLDC PWM**. Twelve bytes is within the ordinary
-64-byte ARDB payload limit and within the default BLE ATT MTU.
+64-byte ARDB payload limit and within the default BLE ATT MTU. The Pico sends
+and the ESP32 publishes at 20 Hz (every 50 ms).
 
 ## Flash the Pico 2 W
 

@@ -17,7 +17,8 @@ constexpr char kHealthPath[] = "/api/v2/health";
 
 // A changed stream is emitted no more than once during this period. When a
 // publisher updates faster, only its most recent valid value is retained.
-constexpr uint32_t kDeltaMinIntervalMs = 100;
+// 50 ms matches the 20 Hz Pico-to-ESP32 PWM telemetry bridge.
+constexpr uint32_t kDeltaMinIntervalMs = 50;
 constexpr uint32_t kStatusPeriodMs = 5000;
 constexpr uint32_t kRequestTimeoutMs = 3000;
 constexpr uint32_t kTlsCloseFlushTimeoutMs = 20;

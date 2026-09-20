@@ -191,7 +191,7 @@ Quest must treat a definition as an upsert by stream ID.
 | `0x01` | `STATUS` | At start and every five seconds |
 | `0x02` | `STREAM_DEFINITION` | At start and after a registry change |
 | `0x03` | `BASELINE` | After initial or replacement definitions |
-| `0x04` | `DELTA` | Changed data, no more often than every 100 ms |
+| `0x04` | `DELTA` | Changed data, no more often than every 50 ms (20 Hz) |
 
 `STATUS` body:
 
@@ -218,7 +218,7 @@ to 2,048 bytes for the one permitted `Jpeg` stream. Sample age saturates at
 AHSP/4 is latest-value delivery. Each registered stream has one fixed cache
 slot; there is no queue, history, replay, or backfill. Valid byte-identical
 values are deduplicated. Faster updates overwrite intermediate values, and a
-delta contains the final changed value at most once every 100 ms. Put source
+delta contains the final changed value at most once every 50 ms (20 Hz). Put source
 timestamps and sequence numbers inside application bytes whenever Quest needs
 them. This protocol is not suitable for lossless capture or safety-critical
 control.

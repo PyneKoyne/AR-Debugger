@@ -8,7 +8,7 @@
  * This sketch replaces the old direct Pico Wi-Fi/MQTT publisher. It drives
  * the motor exactly as before, but advertises a BLE GATT service and notifies
  * three high-side PWM duties as a 12-byte payload (three IEEE-754 floats)
- * every 100 ms. Flash the companion ESP32 sketch at:
+ * at 20 Hz (every 50 ms). Flash the companion ESP32 sketch at:
  *
  *   Demo/pico_tmc6300_ble_ardb_bridge/esp32_pico_tmc6300_bridge.ino
  *
@@ -36,7 +36,8 @@ constexpr char kPwmServiceUuid[] = "a148b750-92c6-4f9a-9f61-a9f1d376adc1";
 constexpr char kPwmCharacteristicUuid[] =
     "a148b751-92c6-4f9a-9f61-a9f1d376adc1";
 constexpr size_t kPwmPayloadBytes = 3 * sizeof(float);
-constexpr uint32_t kPwmReportIntervalMs = 100;
+// Match the ESP32 bridge's 20 Hz MQTT limit.
+constexpr uint32_t kPwmReportIntervalMs = 50;
 
 static_assert(sizeof(float) == 4,
               "The ESP32 bridge expects three 32-bit IEEE-754 floats.");

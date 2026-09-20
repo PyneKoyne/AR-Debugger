@@ -37,8 +37,16 @@ constexpr char kPicoPwmCharacteristicUuid[] =
 constexpr char kPicoDeviceName[] = "ARDB-PWM";
 constexpr char kPwmTopicPath[] = "b/demo/a";
 constexpr size_t kPwmPayloadBytes = 3 * sizeof(float);
+constexpr uint16_t kMqttPublishRateHz = 20;
+// Most standard ESP32 DevKit boards wire their built-in status LED to GPIO2.
+// GPIO2 is a strapping pin, so it is configured only after boot. Do not use
+// this sketch setting for a genuine ESP32-WROOM-DA module: its GPIO2 drives
+// the dual-antenna RF switch instead of an LED.
+constexpr uint8_t kBleLedPin = 2;
 constexpr uint32_t kBleScanIntervalMs = 5000;
 constexpr uint16_t kWifiConnectTimeoutMs = 30000;
+constexpr uint16_t kBleScanningBlinkMs = 250;
+constexpr uint16_t kBleActivityFlashMs = 25;
 
 static_assert(sizeof(float) == 4,
               "The Pico sends three 32-bit IEEE-754 float values.");
@@ -85,12 +93,15 @@ ARDBConfig makeArdbConfig() {
 
 ARDBConfig ardbConfig = makeArdbConfig();
 ARDBNetworkCallbacks ardbNetwork(beginWifi, wifiConnected);
-ARDBClient ardb(mqttTransport, ardbNetwork, ardbConfig);
+// ARDBClient applies this cap per topic. The Pico sends at the matching
+// 20 Hz cadence, so each fresh PWM sample is forwarded once.
+ARDBClient ardb(mqttTransport, ardbNetwork, ardbConfig, kMqttPublishRateHz);
 ARDBTopic pwmTopic;
 
 QueueHandle_t receivedPwm = nullptr;
 portMUX_TYPE bleStateLock = portMUX_INITIALIZER_UNLOCKED;
 volatile uint32_t receivedPwmCount = 0;
+volatile uint32_t lastPwmNotificationAtMs = 0;
 uint32_t publishedPwmCount = 0;
 
 BLEScan* scanner = nullptr;
@@ -110,11 +121,37 @@ void onPicoPwmNotification(BLERemoteCharacteristic*, uint8_t* data,
 
   PwmPayload payload{};
   memcpy(payload.bytes, data, sizeof(payload.bytes));
+  portENTER_CRITICAL(&bleStateLock);
   ++receivedPwmCount;
+  lastPwmNotificationAtMs = millis();
+  portEXIT_CRITICAL(&bleStateLock);
 
   // The only queued value is replaced so the broker receives the newest PWM
   // sample after a short Wi-Fi/MQTT outage rather than a stale backlog.
   xQueueOverwrite(receivedPwm, &payload);
+}
+
+void updateBleLed() {
+  bool connected = false;
+  bool scanning = false;
+  uint32_t lastNotificationAtMs = 0;
+  portENTER_CRITICAL(&bleStateLock);
+  connected = bleConnected;
+  scanning = scanInProgress;
+  lastNotificationAtMs = lastPwmNotificationAtMs;
+  portEXIT_CRITICAL(&bleStateLock);
+
+  const uint32_t now = millis();
+  bool ledOn = false;
+  if (connected) {
+    // A short dark flash shows that PWM notifications are arriving. Between
+    // notifications, the LED remains solid to show the BLE link is alive.
+    ledOn = now - lastNotificationAtMs >= kBleActivityFlashMs;
+  } else if (scanning) {
+    // Slow blink means the bridge is looking for the Pico but is not linked.
+    ledOn = (now / kBleScanningBlinkMs) % 2 == 0;
+  }
+  digitalWrite(kBleLedPin, ledOn ? HIGH : LOW);
 }
 
 const char* wifiStatusName(wl_status_t status) {
@@ -350,6 +387,9 @@ void setup() {
   Serial.println();
   Serial.println("[boot] starting Pico TMC6300 BLE-to-ARDB bridge");
 
+  pinMode(kBleLedPin, OUTPUT);
+  digitalWrite(kBleLedPin, LOW);
+
   receivedPwm = xQueueCreate(/*queueLength=*/1, sizeof(PwmPayload));
   if (receivedPwm == nullptr) {
     Serial.println("[boot] FATAL: PWM queue allocation failed");
@@ -375,6 +415,7 @@ void setup() {
 void loop() {
   ardb.update();
   serviceBle();
+  updateBleLed();
   publishPwm();
   reportBridgeStatus();
   delay(2);
