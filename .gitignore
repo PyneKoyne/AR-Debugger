@@ -1,3 +1,7 @@
 ARDBBroker/HeadCredentials.h
 ARDBBroker/BrokerNetworkCredentials.h
 main_broke/
+
+# Per-sketch credentials. Commit arduino_secrets.example.h instead.
+arduino_secrets.h
+!**/arduino_secrets.example.h
