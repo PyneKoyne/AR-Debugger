@@ -1,11 +1,11 @@
 /*
  * ESP32 servo radar -> ARDB (MQTT)
  *
- *   A servo pans an HC-SR04 ultrasonic sensor across a 180-degree arc. Every
- *   step publishes ONE 8-byte packet to the ARDB head on ONE stream:
- *   float[2] { bearing in degrees, range in centimetres }.
+ *   A 360-degree POSITIONAL servo pans an HC-SR04 back and forth across an
+ *   arc. Readings are batched and published to the ARDB head on ONE stream as
+ *   a run of (bearing, range) pairs.
  *
- *   Servo signal  GPIO 32   (50 Hz LEDC, no servo library needed)
+ *   Servo signal  GPIO 32   (50 Hz LEDC, no servo library)
  *   Ultrasonic    GPIO 33 = TRIG (out), GPIO 25 = ECHO (in)
  *
  * !! ECHO IS 5 V ON A PLAIN HC-SR04 AND THE ESP32 IS NOT 5 V TOLERANT !!
@@ -14,16 +14,23 @@
  *   Power the servo from its own 5 V supply with a common ground; it will
  *   brown out the ESP32 if run from the dev board's regulator.
  *
+ * !! SET SERVO_RANGE_DEG TO MATCH YOUR SERVO !!
+ *   360 for a 360-degree servo, 180 for an ordinary hobby servo. Wrong value
+ *   means the sweep is the wrong size. SERVO_CALIBRATE 1 alternates the two
+ *   arc endpoints so you can check the travel before running for real.
+ *
  * Requires an arduino_secrets.h tab defining:
  *   SECRET_SSID, SECRET_PASS, SECRET_MQTT_HOST, SECRET_MQTT_PORT
  *
  * Libraries: ArduinoMqttClient, ARDBClient
  * Board: any ESP32 dev module (tested layout: ESP32-WROOM-32)
  *
- * BISECTING: set ENABLE_ARDB to 0 to sweep and print to Serial with no network.
+ * BISECTING: set ENABLE_ARDB to 0 to sweep and print to Serial without the
+ * ARDB client. (Wi-Fi still starts; see README "Open items".)
  */
 
 #include <WiFi.h>
+#include <string.h>
 
 #include "arduino_secrets.h"
 
@@ -31,6 +38,11 @@
 //  FEATURE SWITCHES
 // ============================================================
 #define ENABLE_ARDB 1
+
+// 0 = run normally
+// 1 = trim neutral: the horn should sit perfectly still
+// 2 = measure speed: one timed burst, then read off deg/s
+#define SERVO_CALIBRATE 0
 
 #if ENABLE_ARDB
 #include <ARDBClient.h>
@@ -54,35 +66,74 @@ const uint16_t MQTT_PORT = SECRET_MQTT_PORT;
 const char *ARDB_CLIENT_ID = "esp32-radar-01";
 
 // ------------------------------------------------------------
+//  SERVO  (positional, 360-degree travel)
+// ------------------------------------------------------------
+// This is a POSITIONAL servo: the pulse width commands an ANGLE and the servo
+// holds it. It is NOT continuous-rotation -- a CR servo spins while a pulse is
+// applied and cannot hold a position at all. Driving this part with CR-style
+// speed commands is what made it flick between two places instead of sweeping.
+//
+// SERVO_RANGE_DEG is the servo's FULL mechanical travel across the pulse band
+// below. A "360 servo" means 360 here; an ordinary hobby servo means 180.
+// GET THIS RIGHT: with 360 set on a 180-degree part the arc comes out twice as
+// wide and hits the stops; with 180 set on a 360-degree part it comes out half
+// as wide. If the sweep looks the wrong size, this is the constant to change.
+static const float    SERVO_RANGE_DEG = 360.0f;
+static const uint32_t SERVO_MIN_US = 500;    // pulse at 0 deg
+static const uint32_t SERVO_MAX_US = 2500;   // pulse at SERVO_RANGE_DEG
+
+// How fast the beam sweeps. One knob:
+//     seconds per pass = arc / SWEEP_SPEED_DPS
+//     ping spacing deg = SWEEP_SPEED_DPS * PING_PERIOD_MS / 1000
+//   90 deg/s -> 2.0 s per pass, 5.4 deg spacing
+//   60 deg/s -> 3.0 s per pass, 3.6 deg spacing
+static const float SWEEP_SPEED_DPS = 90.0f;
+
+static const uint32_t SERVO_FREQ_HZ = 50;
+static const uint8_t  SERVO_RES_BITS = 16;
+#if ESP_ARDUINO_VERSION_MAJOR < 3
+static const uint8_t  SERVO_LEDC_CHANNEL = 0;  // core 2.x addresses a channel
+#endif
+
+// One-time move to the start of the arc before the first ping.
+static const uint32_t SERVO_HOME_SETTLE_MS = 600;
+
+// ------------------------------------------------------------
 //  Sweep geometry
 // ------------------------------------------------------------
-// The servo's mechanical range is the radar's angular field of view. Keep
-// SWEEP_MIN/MAX inside what the horn can actually reach without stalling.
-static const float SWEEP_MIN_DEG  = 0.0f;
-static const float SWEEP_MAX_DEG  = 180.0f;
-static const float SWEEP_STEP_DEG = 6.0f;   // 30 steps per pass
+static const float SWEEP_MIN_DEG = 0.0f;
+static const float SWEEP_MAX_DEG = 180.0f;
+static const float SWEEP_ARC_DEG = SWEEP_MAX_DEG - SWEEP_MIN_DEG;
 
 // ------------------------------------------------------------
-//  Sweep cadence  -- why 100 ms
+//  Ping cadence and angular resolution
 // ------------------------------------------------------------
-// Three limits meet here and 100 ms is the smallest period that satisfies all
-// three, so every point we publish actually reaches the Quest:
+// Ping spacing is the thing that makes the plot look continuous or sparse:
 //
-//   1. HC-SR04 wants >= 60 ms between triggers or the previous burst's echo
-//      ringing is still in the air when the next one goes out.
-//   2. A 6 deg step takes an SG90-class servo ~15 ms plus settling; measuring
-//      one full period after the move command means it is parked by then.
-//   3. The ARDB head emits deltas no more often than every 100 ms
-//      (kDeltaMinIntervalMs in ARDBBroker/src/HeadConfig.h). Publishing faster
-//      than that does not produce more samples on the Quest, it just discards
-//      the intermediate ones.
+//     spacing (deg) = SERVO_DPS * PING_PERIOD_MS / 1000
 //
-// At 6 deg and 100 ms a 0->180 pass takes 30 steps = 3.0 s.
-static const uint32_t STEP_PERIOD_MS = 100;
+// PING_PERIOD_MS is already at the sensor's floor. The HC-SR04 datasheet asks
+// for >= 60 ms between triggers so the previous burst has stopped ringing
+// before the next one goes out; below that it starts answering with the old
+// echo. So the only honest way to tighten spacing further is to lower
+// SWEEP_SPEED_DPS, trading seconds per pass for degrees per reading.
+//
+//     90 deg/s -> 5.4 deg spacing, 2.0 s per pass
+//     60 deg/s -> 3.6 deg spacing, 3.0 s per pass
+//     45 deg/s -> 2.7 deg spacing, 4.0 s per pass
+static const uint32_t PING_PERIOD_MS = 60;
 
-// The servo needs longer to cross the whole arc than it does to take one step,
-// so hold still after boot and after each direction flip's first command.
-static const uint32_t SERVO_HOME_SETTLE_MS = 600;
+// Task tick. Only has to be fine enough to hit PING_PERIOD_MS on time -- the
+// servo is NOT re-commanded on this tick. It runs at a constant speed and is
+// only written at a reversal, so the motion is genuinely continuous rather
+// than a fast sequence of steps.
+static const uint32_t RADAR_TICK_MS = 10;
+
+// How often loop() drains the batch and publishes. Matching the head's 100 ms
+// delta interval means every packet we send is one the Quest can receive.
+// Defined outside ENABLE_ARDB because loop() paces its Serial output with it
+// either way.
+static const uint32_t PACKET_PERIOD_MS = 100;
 
 // ------------------------------------------------------------
 //  Ultrasonic ranging
@@ -93,24 +144,11 @@ static const float CM_PER_US = 0.0343f / 2.0f;
 static const float MIN_RANGE_CM = 3.0f;    // below this the module lies
 static const float MAX_RANGE_CM = 200.0f;  // trim to the room you are testing in
 
-// pulseIn() bounds the whole wait, so this is also the worst-case time the
-// sketch spends unable to service ARDB. Derived from MAX_RANGE_CM + margin.
+// pulseIn() bounds the whole wait. Must stay well under PING_PERIOD_MS.
 static const uint32_t ECHO_TIMEOUT_US =
     (uint32_t)((MAX_RANGE_CM / CM_PER_US) * 1.2f);
-
-// ------------------------------------------------------------
-//  Servo pulse widths
-// ------------------------------------------------------------
-// Datasheet values for a 9 g hobby servo. Trim these to the horn's real travel
-// if 0/180 stalls the gears -- a stalled servo is the usual cause of a brownout
-// reset mid-sweep.
-static const uint32_t SERVO_MIN_US = 500;   // maps to SWEEP_MIN_DEG
-static const uint32_t SERVO_MAX_US = 2500;  // maps to SWEEP_MAX_DEG
-static const uint32_t SERVO_FREQ_HZ = 50;
-static const uint8_t  SERVO_RES_BITS = 16;
-#if ESP_ARDUINO_VERSION_MAJOR < 3
-static const uint8_t  SERVO_LEDC_CHANNEL = 0;  // core 2.x addresses a channel
-#endif
+static_assert(ECHO_TIMEOUT_US < PING_PERIOD_MS * 1000UL,
+              "echo timeout must fit inside one ping period");
 
 static const uint32_t WIFI_DOWN_RECONNECT_MS = 10000;
 
@@ -121,32 +159,35 @@ static const uint32_t WIFI_DOWN_RECONNECT_MS = 10000;
 // order, units, or byte order, so those are fixed here and must be mirrored by
 // the Quest decoder. See ARDBClient/Quest_Type_Report.md.
 //
-// Frame: the sensor sweeps the horizontal plane. Theta is measured counter-
-// clockwise from the sensor's right-hand axis, matching the servo's own 0..180
-// travel, so theta = 0 points right, 90 straight ahead, 180 left.
+// Frame: theta is measured counter-clockwise from the sensor's right-hand axis
+// in the horizontal plane, so 0 points right, 90 straight ahead, 180 left.
 //
-// All floats below are IEEE-754 binary32 LITTLE-ENDIAN (the ESP32's in-memory
-// layout, copied verbatim by ARDBClient).
+// ONE stream. Each packet is a RUN of consecutive readings, oldest first:
 //
-// ONE stream, ONE packet per sweep step, two fields and nothing else:
+//   a/radar   Binary (255)   8..64 bytes, always a multiple of 8
 //
-//   a/radar   Binary (255)   8 B   float[2] { thetaDeg, rCm }
+//     N x float[2] { thetaDeg, rCm },  N = payloadLength / 8,  1 <= N <= 8
 //
-//     [0] thetaDeg  bearing, 0..180, the servo angle described above.
-//     [1] rCm       range in centimetres from the sensor face.
+//     thetaDeg  bearing, 0..180
+//     rCm       range in centimetres from the sensor face
 //
 //     rCm == 0.0 is the NO-ECHO sentinel: the beam swept that bearing and
 //     nothing answered. It is not a target at the sensor's origin. Zero is
-//     safe as a sentinel because a real reading is always >= MIN_RANGE_CM,
-//     and with only two fields there is nowhere else to put a validity flag.
+//     safe as a sentinel because a real reading is always >= MIN_RANGE_CM.
 //     A decoder that plots rCm without testing for zero will draw a false
 //     contact at the origin on every empty bearing.
 //
-// Binary is the honest descriptor here: the enum has no two-number type, and
-// Binary is defined as opaque application-defined bytes, so the length and
-// this comment are the whole contract. A fixed 8 gives the head a length
-// check. Nothing else is published -- no Cartesian point, no nearest-target
-// summary, no log stream.
+//     All floats are IEEE-754 binary32 LITTLE-ENDIAN (the ESP32's in-memory
+//     layout, copied verbatim by ARDBClient).
+//
+// Batching is what makes the plot continuous. The head emits deltas no more
+// often than every 100 ms, so a one-point packet caps the Quest at 10 readings
+// per second no matter how fast the sensor runs. Packing every reading taken
+// since the last publish into one packet delivers all of them -- ~16.7/s at
+// PING_PERIOD_MS 60 -- through that same 10 Hz channel.
+//
+// A single-point packet is byte-identical to the previous one-reading format,
+// so a decoder written for that still works; it just sees N = 1.
 
 // ============================================================
 //  ARDB - constructed in setup(), NOT as globals.
@@ -161,20 +202,27 @@ static ARDBClient *ardb = nullptr;
 
 static ARDBTopic tRadar;   // the only stream
 
-// float[2] {thetaDeg, rCm}. Asserted rather than assumed: the head enforces
-// the 8 declared below, and a float that is not 4 bytes would be rejected at
-// run time instead of here.
-static const uint16_t RADAR_PACKET_BYTES = 8;
-static_assert(sizeof(float) == 4, "ARDB radar packet assumes 32-bit float");
-static_assert(sizeof(float[2]) == RADAR_PACKET_BYTES,
-              "radar packet must be exactly 8 bytes");
-
 // ARDBClient's per-topic gate restarts from the moment a publish *finishes*,
-// so a 10 Hz limit against a 100 ms step drops a point whenever a publish
+// so a 10 Hz limit against a 100 ms cadence drops a packet whenever a publish
 // takes more than 0 ms -- which is always. Give the client headroom and let
 // the head's 100 ms delta interval be the real pacer.
 static const uint16_t ARDB_PUBLISH_RATE_HZ = 25;
 #endif
+
+// One reading on the wire. Packed explicitly rather than trusting the default
+// layout, because the type guide is emphatic that a struct's natural layout is
+// not a wire schema.
+struct __attribute__((packed)) RadarPoint {
+  float thetaDeg;
+  float rCm;
+};
+static_assert(sizeof(float) == 4, "radar packet assumes 32-bit float");
+static_assert(sizeof(RadarPoint) == 8, "radar point must be exactly 8 bytes");
+
+// 8 x 8 = 64 bytes, exactly the head's ordinary payload cap.
+static const size_t RADAR_MAX_POINTS = 8;
+static_assert(RADAR_MAX_POINTS * sizeof(RadarPoint) <= 64,
+              "batch must fit the ARDB ordinary payload limit");
 
 // ============================================================
 //  SERVO  (LEDC directly; no servo library dependency)
@@ -205,12 +253,14 @@ static void servoWriteMicroseconds(uint32_t pulseUs) {
 #endif
 }
 
+// Commands an absolute bearing. The pulse spans SERVO_RANGE_DEG, so sweeping
+// 0..180 on a 360-degree servo uses the lower half of the pulse band -- which
+// is correct, and why SERVO_RANGE_DEG has to match the actual part.
 static void servoWriteDegrees(float deg) {
-  if (deg < SWEEP_MIN_DEG) deg = SWEEP_MIN_DEG;
-  if (deg > SWEEP_MAX_DEG) deg = SWEEP_MAX_DEG;
+  if (deg < 0.0f) deg = 0.0f;
+  if (deg > SERVO_RANGE_DEG) deg = SERVO_RANGE_DEG;
 
-  const float span = SWEEP_MAX_DEG - SWEEP_MIN_DEG;
-  const float t = (span <= 0.0f) ? 0.0f : (deg - SWEEP_MIN_DEG) / span;
+  const float t = deg / SERVO_RANGE_DEG;
   servoWriteMicroseconds(
       SERVO_MIN_US + (uint32_t)(t * (float)(SERVO_MAX_US - SERVO_MIN_US)));
 }
@@ -300,44 +350,95 @@ static void netSupervisor() {
 }
 
 // ============================================================
-//  SWEEP STATE
+//  SHARED STATE
 // ============================================================
-static float    g_angleDeg = SWEEP_MIN_DEG;  // bearing the horn is parked at
-static float    g_stepDeg = SWEEP_STEP_DEG;  // signed: flips at each end
-static uint32_t g_nextStepAt = 0;
-static uint32_t g_sweepIndex = 0;   // completed passes, for the Serial log only
+// The sweep runs in its own task on core 0. loop() runs on core 1 and only
+// drains finished readings through this mutex, so a blocking network call in
+// loop() can never stall the servo. That matters more than it sounds: with the
+// broker unreachable, ARDBClient retries every 2 s and each attempt sits in a
+// TCP connect whose default timeout is 3000 ms (WIFI_CLIENT_DEF_CONN_TIMEOUT_MS
+// in the ESP32 core). Sharing one thread with that is what made the sweep crawl.
+static SemaphoreHandle_t g_sampleMux = nullptr;
+static TaskHandle_t      g_radarTask = nullptr;
 
-// One publish per sweep step: bearing and range, nothing else. An empty
-// bearing still publishes, with rCm = 0 as the no-echo sentinel, so the
-// viewer keeps getting a packet per step and can clear a stale contact
-// instead of leaving the last hit on screen forever.
-static void publishSample(float thetaDeg, bool valid, float rCm) {
-#if ENABLE_ARDB
-  const float packet[2] = {thetaDeg, valid ? rCm : 0.0f};
-  ardb->print(tRadar, packet);   // array overload sends sizeof(packet) = 8
-#else
-  (void)thetaDeg;
-  (void)valid;
-  (void)rCm;
-#endif
+static RadarPoint g_points[RADAR_MAX_POINTS];
+static size_t     g_pointCount = 0;
+static uint32_t   g_droppedPoints = 0;   // buffer overruns, for the Serial log
+static uint32_t   g_sweepCount = 0;      // completed passes
+
+// Appends one reading, dropping the OLDEST if loop() has fallen behind: on a
+// live plot the newest bearings are the ones worth keeping.
+static void pushPoint(float thetaDeg, float rCm, uint32_t sweeps) {
+  if (!g_sampleMux) return;
+  if (xSemaphoreTake(g_sampleMux, pdMS_TO_TICKS(5)) != pdTRUE) return;
+
+  if (g_pointCount == RADAR_MAX_POINTS) {
+    memmove(&g_points[0], &g_points[1],
+            sizeof(RadarPoint) * (RADAR_MAX_POINTS - 1));
+    g_pointCount = RADAR_MAX_POINTS - 1;
+    ++g_droppedPoints;
+  }
+  g_points[g_pointCount].thetaDeg = thetaDeg;
+  g_points[g_pointCount].rCm = rCm;
+  ++g_pointCount;
+  g_sweepCount = sweeps;
+
+  xSemaphoreGive(g_sampleMux);
 }
 
-// Advances g_angleDeg one step, reversing and closing out the pass at an end.
-static void advanceSweep() {
-  float next = g_angleDeg + g_stepDeg;
+// ============================================================
+//  RADAR TASK  (core 0)
+// ============================================================
+static void radarTask(void *) {
+  float angle = SWEEP_MIN_DEG;
+  float dir = 1.0f;
+  uint32_t sweeps = 0;
 
-  if (next > SWEEP_MAX_DEG || next < SWEEP_MIN_DEG) {
-    ++g_sweepIndex;
-    Serial.printf("[sweep %lu complete]\n", (unsigned long)g_sweepIndex);
+  // Park at the start of the arc and let the horn get there before the first
+  // ping, or reading 1 is taken somewhere mid-travel.
+  servoWriteDegrees(angle);
+  vTaskDelay(pdMS_TO_TICKS(SERVO_HOME_SETTLE_MS));
 
-    g_stepDeg = -g_stepDeg;
-    next = g_angleDeg + g_stepDeg;
-    if (next > SWEEP_MAX_DEG) next = SWEEP_MAX_DEG;
-    if (next < SWEEP_MIN_DEG) next = SWEEP_MIN_DEG;
+  uint32_t lastMove = millis();
+  uint32_t nextPing = millis();
+
+  for (;;) {
+    const uint32_t now = millis();
+
+    // Integrate position from elapsed time rather than a fixed step, so speed
+    // stays honest when an iteration runs late. Every tick commands a new
+    // angle, 0.9 deg apart at 90 deg/s, which reads as continuous motion.
+    uint32_t dt = now - lastMove;
+    lastMove = now;
+    if (dt > RADAR_TICK_MS * 4) dt = RADAR_TICK_MS * 4;  // no lurch after a stall
+
+    angle += dir * SWEEP_SPEED_DPS * (float)dt / 1000.0f;
+    if (angle >= SWEEP_MAX_DEG) {
+      angle = SWEEP_MAX_DEG;
+      dir = -1.0f;
+      ++sweeps;
+    } else if (angle <= SWEEP_MIN_DEG) {
+      angle = SWEEP_MIN_DEG;
+      dir = 1.0f;
+      ++sweeps;
+    }
+    servoWriteDegrees(angle);
+
+    if ((int32_t)(now - nextPing) >= 0) {
+      nextPing += PING_PERIOD_MS;
+      if ((int32_t)(now - nextPing) > 0) nextPing = now + PING_PERIOD_MS;
+
+      // Bearing latched BEFORE the ping: the horn keeps moving during the
+      // up-to-14 ms pulseIn, about 1.3 deg at 90 deg/s.
+      const float bearing = angle;
+      float rCm = 0.0f;
+      const bool valid = sonarPingCm(rCm);
+      pushPoint(bearing, valid ? rCm : 0.0f, sweeps);
+    }
+
+    // Yields core 0 to its idle task. Without this the task watchdog trips.
+    vTaskDelay(pdMS_TO_TICKS(RADAR_TICK_MS));
   }
-
-  g_angleDeg = next;
-  servoWriteDegrees(g_angleDeg);
 }
 
 // ============================================================
@@ -347,27 +448,42 @@ void setup() {
   Serial.begin(115200);
   delay(200);
   Serial.println();
-  Serial.println("=== ESP32 servo radar -> ARDB ===");
+  Serial.println("=== ESP32 servo radar (360 servo) -> ARDB ===");
   Serial.printf("[boot] servo=GPIO%d trig=GPIO%d echo=GPIO%d\n", SERVO_PIN,
                 TRIG_PIN, ECHO_PIN);
-  Serial.printf("[boot] sweep %.0f..%.0f deg, step %.1f deg, %lu ms/step\n",
-                SWEEP_MIN_DEG, SWEEP_MAX_DEG, SWEEP_STEP_DEG,
-                (unsigned long)STEP_PERIOD_MS);
 
   sonarBegin();
   servoBegin();
 
-  // Park at the start of the arc and let the horn get there before the first
-  // ping, otherwise sample 1 is taken somewhere between the two bearings.
-  g_angleDeg = SWEEP_MIN_DEG;
-  g_stepDeg = SWEEP_STEP_DEG;
-  servoWriteDegrees(g_angleDeg);
+#if SERVO_CALIBRATE == 1
+  // ---- Endpoint check -----------------------------------------------
+  Serial.println();
+  Serial.println("=== CALIBRATE 1: endpoint check ===");
+  Serial.printf("Alternating %.0f and %.0f deg every 2 s.\n",
+                SWEEP_MIN_DEG, SWEEP_MAX_DEG);
+  Serial.printf("SERVO_RANGE_DEG is %.0f. If the horn moves the wrong amount,\n",
+                SERVO_RANGE_DEG);
+  Serial.println("that constant does not match the servo -- try 180 or 360.");
+  return;
+
+#else
+  // ---- Normal run ---------------------------------------------------
+  Serial.printf("[boot] arc %.0f..%.0f deg on a %.0f deg servo, %.0f deg/s\n",
+                SWEEP_MIN_DEG, SWEEP_MAX_DEG, SERVO_RANGE_DEG, SWEEP_SPEED_DPS);
+  Serial.printf("[boot] ping %lu ms -> %.1f deg spacing, %.1f s per pass\n",
+                (unsigned long)PING_PERIOD_MS,
+                SWEEP_SPEED_DPS * (float)PING_PERIOD_MS / 1000.0f,
+                SWEEP_ARC_DEG / SWEEP_SPEED_DPS);
 
   wifiStart();
 
 #if ENABLE_ARDB
   Serial.println("[boot] constructing ARDB");
   ardbTransport = new WiFiClient();
+  // Default is 3000 ms. ARDBClient's mqttConnectTimeoutMs only bounds the
+  // CONNACK wait, not the TCP connect underneath it, so with no broker on the
+  // network loop() would otherwise block for 3 s on every retry.
+  ardbTransport->setConnectionTimeout(250);
   ardbConfig = new ARDBConfig(ARDBConfig::wifiMqtt(
       WIFI_SSID, WIFI_PASS, MQTT_HOST, ARDB_CLIENT_ID, MQTT_PORT));
   // beginNetwork is null: the sketch already owns Wi-Fi, ARDB only polls it.
@@ -375,10 +491,10 @@ void setup() {
   ardb = new ARDBClient(*ardbTransport, *ardbNetwork, *ardbConfig,
                         ARDB_PUBLISH_RATE_HZ);
 
-  // The single stream. The head assigns its own stream ID; the Quest must use
-  // that, not this registration position.
+  // Variable length: a packet carries however many readings were taken since
+  // the last publish, so 0 rather than a fixed byte count.
   tRadar = ardb->addTopic("a/radar", ARDBVisualType::Binary,
-                          "Radar angle/range", RADAR_PACKET_BYTES);
+                          "Radar angle/range", 0);
 
   if (!tRadar.valid()) {
     Serial.println("[boot] WARNING: radar topic failed to register");
@@ -388,14 +504,34 @@ void setup() {
   ardb->begin();
 #endif
 
-  delay(SERVO_HOME_SETTLE_MS);
-  g_nextStepAt = millis();
+  g_sampleMux = xSemaphoreCreateMutex();
+  if (!g_sampleMux) {
+    Serial.println("[boot] FATAL: mutex alloc failed");
+    return;   // no task: the sweep never starts, and Serial says why
+  }
+
+  // Core 0. loop() owns core 1 and everything that can block on the network.
+  if (xTaskCreatePinnedToCore(radarTask, "radar", 4096, nullptr, 2,
+                              &g_radarTask, 0) != pdPASS) {
+    Serial.println("[boot] FATAL: radar task failed to start");
+  }
+#endif  // SERVO_CALIBRATE
 }
 
 // ============================================================
 //  LOOP
 // ============================================================
 void loop() {
+#if SERVO_CALIBRATE != 0
+  servoWriteDegrees(SWEEP_MIN_DEG);
+  Serial.printf("commanded %.0f deg\n", SWEEP_MIN_DEG);
+  delay(2000);
+  servoWriteDegrees(SWEEP_MAX_DEG);
+  Serial.printf("commanded %.0f deg\n", SWEEP_MAX_DEG);
+  delay(2000);
+  return;
+#else
+
 #if ENABLE_ARDB
   ardb->update();  // drives Wi-Fi/MQTT state; call every iteration
 
@@ -411,25 +547,50 @@ void loop() {
 
   netSupervisor();
 
+  // Drain on the head's own cadence. Publishing faster would only produce
+  // packets it throttles away; slower would let the batch overflow.
+  static uint32_t nextPacketAt = 0;
   const uint32_t now = millis();
-  if ((int32_t)(now - g_nextStepAt) < 0) return;
+  if ((int32_t)(now - nextPacketAt) < 0) {
+    delay(2);
+    return;
+  }
+  nextPacketAt = now + PACKET_PERIOD_MS;
 
-  // Fixed cadence rather than now + PERIOD, so a slow publish does not stretch
-  // the sweep. Resynchronise if we ever fall a whole step behind.
-  g_nextStepAt += STEP_PERIOD_MS;
-  if ((int32_t)(now - g_nextStepAt) > 0) g_nextStepAt = now + STEP_PERIOD_MS;
+  RadarPoint batch[RADAR_MAX_POINTS];
+  size_t     n = 0;
+  uint32_t   sweeps = 0, dropped = 0;
 
-  // The horn was commanded to g_angleDeg one full period ago, so it is parked.
-  float rCm = 0.0f;
-  const bool valid = sonarPingCm(rCm);
-
-  publishSample(g_angleDeg, valid, rCm);
-
-  if (valid) {
-    Serial.printf("%6.1f deg  %7.1f cm\n", g_angleDeg, rCm);
-  } else {
-    Serial.printf("%6.1f deg        --\n", g_angleDeg);
+  // Zero timeout: if the task holds the mutex we simply retry next cycle
+  // rather than waiting on it.
+  if (g_sampleMux && xSemaphoreTake(g_sampleMux, 0) == pdTRUE) {
+    n = g_pointCount;
+    if (n) memcpy(batch, g_points, sizeof(RadarPoint) * n);
+    g_pointCount = 0;
+    sweeps = g_sweepCount;
+    dropped = g_droppedPoints;
+    xSemaphoreGive(g_sampleMux);
   }
 
-  advanceSweep();
+  if (n) {
+#if ENABLE_ARDB
+    // One packet, N readings, oldest first.
+    ardb->printBytes(tRadar, batch, n * sizeof(RadarPoint));
+#endif
+    for (size_t i = 0; i < n; i++) {
+      if (batch[i].rCm > 0.0f) {
+        Serial.printf("%6.1f deg  %7.1f cm\n", batch[i].thetaDeg, batch[i].rCm);
+      } else {
+        Serial.printf("%6.1f deg        --\n", batch[i].thetaDeg);
+      }
+    }
+  }
+
+  static uint32_t lastSweep = 0;
+  if (sweeps != lastSweep) {
+    lastSweep = sweeps;
+    Serial.printf("[sweep %lu complete] batch %u, dropped %lu\n",
+                  (unsigned long)sweeps, (unsigned)n, (unsigned long)dropped);
+  }
+#endif  // SERVO_CALIBRATE
 }
