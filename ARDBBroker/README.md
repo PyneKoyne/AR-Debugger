@@ -152,8 +152,13 @@ Use simple GET requests: no body, custom headers, credentials, or query string. 
 The health response is:
 
 ```json
-{"protocol":4,"streams":0,"accepted":0,"deduplicated":0,"malformed":0,"rejected":0}
+{"protocol":4,"streams":0,"accepted":0,"deduplicated":0,"malformed":0,"rejected":0,"heap_total_bytes":0,"heap_used_bytes":0,"heap_free_bytes":0}
 ```
+
+The heap fields are byte counts sampled while handling the request. `heap_total_bytes`
+is the allocatable heap supplied by the active Arduino core;
+`heap_used_bytes` and `heap_free_bytes` are its current allocation and free
+capacity. They do not include static allocations, task stacks, or ESP32 PSRAM.
 
 Development responses include `Access-Control-Allow-Origin: *`, `Cache-Control: no-store`, and `X-Content-Type-Options: nosniff`. Before distribution, replace the wildcard with the exact Quest origin and design real TLS trust, MQTT security, and authorization. CORS is not authorization.
 

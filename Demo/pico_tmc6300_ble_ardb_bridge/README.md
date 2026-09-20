@@ -28,11 +28,20 @@ ARDBClient library.
 
 ## Flash the ESP32
 
-1. Copy `arduino_secrets.h.example` to `arduino_secrets.h` in this folder and
-   fill in the Wi-Fi network and broker that the **ESP32** can reach.
+1. Fill in the local `arduino_secrets.h` beside the ESP32 sketch with the
+   Wi-Fi network and broker that the **ESP32** can reach. It is deliberately
+   ignored by Git; use `arduino_secrets.h.example` as a safe reference.
 2. Install `ArduinoMqttClient` and the local `ARDBClient` library in Arduino
    IDE. `BLEDevice` and Wi-Fi support come from the ESP32 Arduino core.
-3. Open `esp32_pico_tmc6300_bridge.ino`, select your ESP32 board, and upload.
+3. Open `esp32_pico_tmc6300_bridge/esp32_pico_tmc6300_bridge.ino` and select
+   your ESP32 board. Under **Tools → Partition Scheme**, select **Huge APP
+   (3MB No OTA/1MB SPIFFS)**, then upload.
+
+The ESP32 sketch includes a local `partitions.csv` that supplies the matching
+3 MiB application partition on a standard 4 MiB ESP32. The Arduino IDE still
+uses the selected **Partition Scheme** to enforce its compile-time size limit,
+so that menu selection is required. This layout does not support over-the-air
+firmware updates.
 
 The ESP32 scans for the TMC6300 BLE service, subscribes to the PWM
 characteristic, reconnects after a disconnect, and only forwards notifications

@@ -6,6 +6,7 @@
 #include <string.h>
 
 #include "HeadByteWriter.h"
+#include "HeadMemoryStats.h"
 
 namespace {
 
@@ -181,18 +182,23 @@ void HeadHttpsStream::serviceLiveStream() {
 }
 
 bool HeadHttpsStream::sendHealth() {
-  char body[192];
+  const ardb_head::HeapMemoryStats heap = ardb_head::readHeapMemoryStats();
+  char body[320];
   const int bodyLength =
       snprintf(body, sizeof(body),
                "{\"protocol\":%u,\"streams\":%u,\"accepted\":%lu,"
                "\"deduplicated\":%lu,\"malformed\":%lu,"
-               "\"rejected\":%lu}\n",
+               "\"rejected\":%lu,\"heap_total_bytes\":%lu,"
+               "\"heap_used_bytes\":%lu,\"heap_free_bytes\":%lu}\n",
                static_cast<unsigned int>(ardb_head::kLiveProtocolVersion),
                static_cast<unsigned int>(telemetry_.streamCount()),
                static_cast<unsigned long>(telemetry_.acceptedSamples()),
                static_cast<unsigned long>(telemetry_.deduplicatedSamples()),
                static_cast<unsigned long>(telemetry_.malformedSamples()),
-               static_cast<unsigned long>(telemetry_.rejectedSamples()));
+               static_cast<unsigned long>(telemetry_.rejectedSamples()),
+               static_cast<unsigned long>(heap.totalBytes),
+               static_cast<unsigned long>(heap.usedBytes),
+               static_cast<unsigned long>(heap.freeBytes));
   if (bodyLength <= 0 || static_cast<size_t>(bodyLength) >= sizeof(body) ||
       !writeHttpHeader("200 OK", "application/json",
                        static_cast<size_t>(bodyLength), false)) {
