@@ -24,6 +24,7 @@ enum class ARDBVisualType : uint8_t {
   Imu6I16 = 3,
   Imu6I16T32 = 4,
   Event = 5,
+  THREE_NUM = 6,
   Binary = 255
 };
 
@@ -121,10 +122,15 @@ class ARDBTopic {
 
 class ARDBClient {
  public:
-  ARDBClient(Client& network, const ARDBConfig& config);
+  // Data for each topic is sent at most dataPublishRateHz times per second.
+  // Pass 0 to disable rate limiting. Metadata and MQTT connection traffic are
+  // not rate limited.
+  ARDBClient(Client& network, const ARDBConfig& config,
+             uint16_t dataPublishRateHz = 10);
   ARDBClient(Client& network,
              const ARDBNetworkCallbacks& networkCallbacks,
-             const ARDBConfig& config);
+             const ARDBConfig& config,
+             uint16_t dataPublishRateHz = 10);
 
   // Call once from setup(), after constructing the object.
   void begin();
@@ -140,9 +146,13 @@ class ARDBClient {
   // Topic/name pointers must remain valid for the client lifetime. String
   // literals and global const character arrays are ideal; Arduino String is not.
   // A returned invalid handle means the descriptor could not be registered.
-  ARDBTopic addTopic(const char* topic, ARDBVisualType type, const char* name);
-  ARDBTopic add_topic(const char* topic, ARDBVisualType type, const char* name) {
-    return addTopic(topic, type, name);
+  // expectedPayloadBytes is the fixed application-byte length sent on this
+  // topic. Zero permits variable payloads up to the head node's limit.
+  ARDBTopic addTopic(const char* topic, ARDBVisualType type, const char* name,
+                     uint16_t expectedPayloadBytes = 0);
+  ARDBTopic add_topic(const char* topic, ARDBVisualType type, const char* name,
+                      uint16_t expectedPayloadBytes = 0) {
+    return addTopic(topic, type, name, expectedPayloadBytes);
   }
 
   // Typed print overloads infer the byte length with sizeof(). Wire types must
@@ -200,6 +210,7 @@ class ARDBClient {
     const char* topic;
     ARDBVisualType type;
     const char* name;
+    uint16_t expectedPayloadBytes;
   };
 
   static bool isDue(uint32_t now, uint32_t target);
@@ -220,6 +231,8 @@ class ARDBClient {
   bool publishMetadata(const TopicSlot& topic, uint8_t topicId);
   bool publishToTopic(const char* topic, const void* data, size_t length);
   bool writeBytes(const void* data, size_t length);
+  bool dataPublishDue(uint32_t now, uint32_t nextPublishAt) const;
+  void scheduleDataPublish(uint32_t& nextPublishAt, uint32_t now);
 
   MqttClient _mqtt;
   ARDBNetworkCallbacks _networkCallbacks;
@@ -234,6 +247,9 @@ class ARDBClient {
   uint32_t _nextAttemptAt;
   uint32_t _networkAttemptAt;
   uint32_t _nextMetadataAt;
+  uint32_t _topicNextPublishAt[ARDB_MAX_TOPICS];
+  uint32_t _directNextPublishAt;
+  uint32_t _dataPublishIntervalMs;
   uint32_t _droppedPackets;
   uint32_t _sentPackets;
   int _lastConnectError;

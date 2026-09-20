@@ -3,33 +3,27 @@
 MqttEventLogger* MqttEventLogger::instance_ = nullptr;
 
 MqttEventLogger::MqttEventLogger(MqttBroker& broker, const char* loggerId)
-    : broker_(broker), loggerClient_(&broker, loggerId)
-{
-}
+    : broker_(broker), loggerClient_(&broker, loggerId) {}
 
-void MqttEventLogger::begin()
-{
+void MqttEventLogger::begin() {
   instance_ = this;
   loggerClient_.setCallback(onMqttPublish);
   loggerClient_.subscribe(Topic("#"));
 }
 
-void MqttEventLogger::update()
-{
+void MqttEventLogger::update() {
   logClientEvents();
 }
 
 void MqttEventLogger::onMqttPublish(const MqttClient*, const Topic& topic,
-                                    const char* payload, size_t payloadLength)
-{
+                                    const char* payload, size_t payloadLength) {
   if (instance_ != nullptr) {
     instance_->logMqttPublish(topic, payload, payloadLength);
   }
 }
 
 void MqttEventLogger::logMqttPublish(const Topic& topic, const char* payload,
-                                     size_t payloadLength)
-{
+                                     size_t payloadLength) {
   Serial.print("[MQTT] PUBLISH topic=\"");
   Serial.print(topic.c_str());
   Serial.print("\" payload=\"");
@@ -37,10 +31,10 @@ void MqttEventLogger::logMqttPublish(const Topic& topic, const char* payload,
   Serial.println("\"");
 }
 
-void MqttEventLogger::printEscapedPayload(const char* payload, size_t length)
-{
-  const size_t maxLoggedBytes = 256;
-  const size_t bytesToPrint = length < maxLoggedBytes ? length : maxLoggedBytes;
+void MqttEventLogger::printEscapedPayload(const char* payload, size_t length) {
+  constexpr size_t kMaxLoggedBytes = 256;
+  const size_t bytesToPrint =
+      length < kMaxLoggedBytes ? length : kMaxLoggedBytes;
 
   for (size_t i = 0; i < bytesToPrint; ++i) {
     const uint8_t byte = static_cast<uint8_t>(payload[i]);
@@ -56,13 +50,12 @@ void MqttEventLogger::printEscapedPayload(const char* payload, size_t length)
     }
   }
 
-  if (length > maxLoggedBytes) {
+  if (length > kMaxLoggedBytes) {
     Serial.print("... (truncated)");
   }
 }
 
-void MqttEventLogger::logClientEvents()
-{
+void MqttEventLogger::logClientEvents() {
   const std::vector<MqttClient*> clients = broker_.getClients();
   std::vector<SeenClient> currentClients;
 

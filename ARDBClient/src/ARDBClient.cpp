@@ -5,8 +5,8 @@
 
 namespace {
 const char* const kDefaultMetadataPrefix = "ardb/meta";
-const uint8_t kMetadataProtocolVersion = 2;
-const uint8_t kMetadataHeaderSize = 8;
+const uint8_t kMetadataProtocolVersion = 3;
+const uint8_t kMetadataHeaderSize = 10;
 const uint8_t kChecksumSize = 2;
 }
 
@@ -57,12 +57,14 @@ uint8_t ARDBTopic::id() const {
   return valid() ? static_cast<uint8_t>(_index + 1) : 0;
 }
 
-ARDBClient::ARDBClient(Client& network, const ARDBConfig& config)
-    : ARDBClient(network, ARDBNetworkCallbacks(), config) {}
+ARDBClient::ARDBClient(Client& network, const ARDBConfig& config,
+                       uint16_t dataPublishRateHz)
+    : ARDBClient(network, ARDBNetworkCallbacks(), config, dataPublishRateHz) {}
 
 ARDBClient::ARDBClient(Client& network,
                        const ARDBNetworkCallbacks& networkCallbacks,
-                       const ARDBConfig& config)
+                       const ARDBConfig& config,
+                       uint16_t dataPublishRateHz)
     : _mqtt(network),
       _networkCallbacks(networkCallbacks),
       _config(config),
@@ -76,6 +78,12 @@ ARDBClient::ARDBClient(Client& network,
       _nextAttemptAt(0),
       _networkAttemptAt(0),
       _nextMetadataAt(0),
+      _topicNextPublishAt{},
+      _directNextPublishAt(0),
+      _dataPublishIntervalMs(dataPublishRateHz == 0
+                                 ? 0
+                                 : (1000UL + dataPublishRateHz - 1) /
+                                       dataPublishRateHz),
       _droppedPackets(0),
       _sentPackets(0),
       _lastConnectError(MQTT_CONNECTION_REFUSED) {}
@@ -84,6 +92,8 @@ void ARDBClient::begin() {
   _begun = true;
   _connected = false;
   _metadataIndex = 0;
+  memset(_topicNextPublishAt, 0, sizeof(_topicNextPublishAt));
+  _directNextPublishAt = 0;
 
   _mqtt.setCleanSession(true);
   _mqtt.setKeepAliveInterval(static_cast<unsigned long>(_config.keepAliveSeconds) * 1000UL);
@@ -179,14 +189,19 @@ ARDBConnectionState ARDBClient::state() const {
   return _state;
 }
 
-ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type, const char* name) {
-  if (!hasText(topic) || !hasText(name) || strlen(topic) > 255 || strlen(name) > 255) {
+ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type,
+                               const char* name,
+                               uint16_t expectedPayloadBytes) {
+  if (!hasText(topic) || !hasText(name) || strlen(topic) > 255 ||
+      strlen(name) > 255 || expectedPayloadBytes > 64) {
     return ARDBTopic();
   }
 
   for (uint8_t index = 0; index < _topicCount; ++index) {
     if (strcmp(_topics[index].topic, topic) == 0) {
-      if (_topics[index].type == type && strcmp(_topics[index].name, name) == 0) {
+      if (_topics[index].type == type &&
+          _topics[index].expectedPayloadBytes == expectedPayloadBytes &&
+          strcmp(_topics[index].name, name) == 0) {
         return ARDBTopic(this, index);
       }
       return ARDBTopic();
@@ -198,7 +213,7 @@ ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type, const cha
   }
 
   const uint8_t index = _topicCount;
-  _topics[_topicCount++] = {topic, type, name};
+  _topics[_topicCount++] = {topic, type, name, expectedPayloadBytes};
 
   if (_connected) {
     queueMetadata(millis());
@@ -227,6 +242,16 @@ bool ARDBClient::publish(const ARDBTopic& topic, const void* data, size_t length
   if (descriptor == nullptr) {
     return false;
   }
+  if (descriptor->expectedPayloadBytes != 0 &&
+      length != descriptor->expectedPayloadBytes) {
+    return false;
+  }
+
+  const uint32_t now = millis();
+  if (!dataPublishDue(now, _topicNextPublishAt[topic._index])) {
+    ++_droppedPackets;
+    return false;
+  }
 
   // Send this stream's retained descriptor before its first data packet of a
   // connection. MQTT preserves publish ordering from this client to the broker.
@@ -236,11 +261,25 @@ bool ARDBClient::publish(const ARDBTopic& topic, const void* data, size_t length
     return false;
   }
 
-  return publishToTopic(descriptor->topic, data, length);
+  const bool sent = publishToTopic(descriptor->topic, data, length);
+  if (sent) {
+    scheduleDataPublish(_topicNextPublishAt[topic._index], millis());
+  }
+  return sent;
 }
 
 bool ARDBClient::publish(const char* topic, const void* data, size_t length) {
-  return publishToTopic(topic, data, length);
+  const uint32_t now = millis();
+  if (!dataPublishDue(now, _directNextPublishAt)) {
+    ++_droppedPackets;
+    return false;
+  }
+
+  const bool sent = publishToTopic(topic, data, length);
+  if (sent) {
+    scheduleDataPublish(_directNextPublishAt, millis());
+  }
+  return sent;
 }
 
 bool ARDBClient::publishToTopic(const char* topic, const void* data, size_t length) {
@@ -294,6 +333,16 @@ uint8_t ARDBClient::topicCount() const {
 
 bool ARDBClient::isDue(uint32_t now, uint32_t target) {
   return static_cast<int32_t>(now - target) >= 0;
+}
+
+bool ARDBClient::dataPublishDue(uint32_t now, uint32_t nextPublishAt) const {
+  return _dataPublishIntervalMs == 0 || isDue(now, nextPublishAt);
+}
+
+void ARDBClient::scheduleDataPublish(uint32_t& nextPublishAt, uint32_t now) {
+  if (_dataPublishIntervalMs != 0) {
+    nextPublishAt = now + _dataPublishIntervalMs;
+  }
 }
 
 bool ARDBClient::hasText(const char* value) {
@@ -357,6 +406,9 @@ void ARDBClient::connectMqtt(uint32_t now) {
     _connected = true;
     _state = ARDBConnectionState::Connected;
     _lastConnectError = MQTT_SUCCESS;
+    // A new MQTT session can publish its first data point immediately.
+    memset(_topicNextPublishAt, 0, sizeof(_topicNextPublishAt));
+    _directNextPublishAt = 0;
     queueMetadata(now);
     return;
   }
@@ -465,6 +517,8 @@ bool ARDBClient::publishMetadata(const TopicSlot& topic, uint8_t topicId) {
       'A', 'R', 'D', 'B',
       kMetadataProtocolVersion,
       static_cast<uint8_t>(topic.type),
+      static_cast<uint8_t>(topic.expectedPayloadBytes >> 8),
+      static_cast<uint8_t>(topic.expectedPayloadBytes & 0xff),
       static_cast<uint8_t>(dataTopicLength),
       static_cast<uint8_t>(nameLength)};
 

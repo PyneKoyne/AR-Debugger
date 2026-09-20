@@ -13,9 +13,9 @@ topic string.
 
 ```cpp
 ARDBTopic imu = ardb.addTopic("a/demo/i", ARDBVisualType::Imu6I16T32,
-                              "Demo IMU");
+                              "Demo IMU", 16);
 ARDBTopic temp = ardb.addTopic("a/demo/t", ARDBVisualType::ScalarF32,
-                               "Temperature");
+                               "Temperature", 4);
 
 void loop() {
   ardb.update();
@@ -34,7 +34,7 @@ registration returns an invalid handle.
 | `begin()` | Starts ARDB networking and connection attempts. |
 | `update()` | Advances Wi-Fi/MQTT state and publishes pending metadata. Call it from `loop()`. |
 | `connected()` | Current MQTT connection flag. |
-| `addTopic(topic, type, name)` | Registers a data topic and its Quest-facing descriptor. |
+| `addTopic(topic, type, name, expectedPayloadBytes)` | Registers a data topic and its Quest-facing descriptor. Zero permits variable-size data. |
 | `print(handle, value)` | Publishes a trivially-copyable object; byte count comes from `sizeof`. |
 | `print(handle, array)` | Publishes all bytes of a fixed-size array. |
 | `print(handle, "text")` / `print(handle, String)` | Publishes text without its terminating NUL. |
@@ -72,7 +72,7 @@ ARDBConfig config = ARDBConfig::wifiMqtt(
 For this registration:
 
 ```cpp
-ardb.addTopic("a/demo/i", ARDBVisualType::Imu6I16T32, "Demo IMU");
+ardb.addTopic("a/demo/i", ARDBVisualType::Imu6I16T32, "Demo IMU", 16);
 ```
 
 data is sent to `a/demo/i`. Its retained descriptor is sent to:
@@ -106,21 +106,23 @@ The application length is MQTT payload length minus two; payloads shorter than
 two bytes are invalid. `printBytes()` needs a length only because a C++ pointer
 does not retain the size of its backing data.
 
-Metadata uses protocol version 2:
+Metadata uses protocol version 3:
 
 ```text
 0..3   "ARDB"
-4      version = 2
+4      version = 3
 5      visualization type
-6      data-topic UTF-8 byte length (u8)
-7      display-name UTF-8 byte length (u8)
-8..    data-topic bytes, then display-name bytes
+6..7   expected application-payload bytes (u16 big-endian; zero = variable)
+8      data-topic UTF-8 byte length (u8)
+9      display-name UTF-8 byte length (u8)
+10..   data-topic bytes, then display-name bytes
 last2  CRC-16/CCITT-FALSE (big-endian u16)
 ```
 
 Topic and display-name strings are each limited to 255 bytes and have no NUL
-on the wire. A receiver must verify magic, version, checksum, and that the two
-declared lengths plus 10 equal the MQTT payload length before accepting metadata.
+on the wire. A receiver must verify magic, version, checksum, the declared
+application length, and that the two declared string lengths plus 12 equal the
+MQTT payload length before accepting metadata.
 
 Checksum parameters are CRC-16/CCITT-FALSE: polynomial `0x1021`, initial value
 `0xFFFF`, no input/output reflection, final XOR `0x0000`. The checksum covers
@@ -157,9 +159,18 @@ there is no per-frame ARDB stream ID or multiplexing envelope. Data publishes
 use QoS 0 and are not retained.
 
 Defaults: MQTT port `1883`, retry `2` seconds, connect timeout `250` ms,
-keepalive `30` seconds, retained metadata enabled, and no periodic metadata
-resend. Configuration and registered string pointers are borrowed, not copied;
-keep them alive while the client exists.
+keepalive `30` seconds, retained metadata enabled, no periodic metadata
+resend, and a 10 Hz data-publish limit per registered topic. Override the last
+default directly in the `ARDBClient` declaration, for example:
+
+```cpp
+ARDBClient ardb(network, callbacks, config, /* dataPublishRateHz */ 25);
+```
+
+Pass `0` for an unlimited data rate. Metadata and connection work are not
+rate-limited; rate-limited data sends return `false` and increment
+`droppedPackets()`. Configuration and registered string pointers are borrowed,
+not copied; keep them alive while the client exists.
 
 The source was syntax-checked with Arduino/ArduinoMqttClient-compatible test
 headers. Mock MQTT tests cover metadata ordering and IDs, periodic metadata

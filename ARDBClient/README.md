@@ -11,6 +11,10 @@ See the full [library report](ARDBClient_Report.md) for the API, wire format,
 connection behavior, Quest integration, resource tradeoffs, and validation
 plan.
 
+For a Quest-focused explanation of every `ARDBVisualType`, its payload
+contract, and the head-to-Quest delivery path, see the
+[Quest type guide](Quest_Type_Report.md).
+
 ## Install
 
 Copy the `ARDBClient` directory into your Arduino libraries directory, then
@@ -47,6 +51,22 @@ ARDBConfig config = ARDBConfig::wifiMqtt(
 This factory only fills `ARDBConfig`; it does not include or call a Wi-Fi
 library. As with direct field assignment, its string arguments are borrowed and
 must remain valid for the client's lifetime.
+
+## Telemetry rate
+
+`ARDBClient` sends data for each registered topic at most 10 times per second
+by default. Override that rate in the client declaration; pass `0` for no
+library-side limit:
+
+```cpp
+ARDBClient ardb(network, ardbNetwork, ardbConfig,
+                /* dataPublishRateHz */ 25);
+```
+
+The limit applies only to successful data messages. MQTT connection work and
+ARDB metadata continue to run as required, and direct `publish(const char*,
+...)` calls share their own rate limit. A rate-limited send returns `false` and
+is counted by `droppedPackets()`.
 
 ## Connection behavior
 
@@ -88,8 +108,9 @@ publishes are dropped immediately and counted by `droppedPackets()`.
 
 ## Topic metadata
 
-`addTopic(topic, type, name)` returns an `ARDBTopic` handle and registers a
-static descriptor. On MQTT connect, and then every `metadataResendMs`,
+`addTopic(topic, type, name, expectedPayloadBytes)` returns an `ARDBTopic`
+handle and registers a descriptor. `expectedPayloadBytes` is the fixed
+application-byte length; use `0` for a variable payload. On MQTT connect, and then every `metadataResendMs`,
 ARDBClient sends one descriptor per topic to
 `ardb/meta/<clientId>/<topic-id>` (or the configured prefix). When
 `metadataRetained` is true, configure the TinyMqtt broker with enough retained
@@ -103,7 +124,8 @@ The binary metadata payload is:
 
 ```text
 "ARDB" | protocol-version:u8 | visualization-type:u8 |
-topic-length:u8 | name-length:u8 | topic bytes | name bytes | crc16:u16-be
+expected-payload-bytes:u16-be | topic-length:u8 | name-length:u8 |
+topic bytes | name bytes | crc16:u16-be
 ```
 
 Names and topic strings are stored as pointers. Use string literals or global

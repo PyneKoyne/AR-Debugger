@@ -20,11 +20,23 @@ const uint16_t MQTT_PORT = 1883;
 
 WiFiClient network;
 
+void beginArdbNetwork(const char* ssid, const char* password) {
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+}
+
+bool ardbNetworkConnected() {
+  return WiFi.status() == WL_CONNECTED;
+}
+
+ARDBNetworkCallbacks ardbNetwork(beginArdbNetwork, ardbNetworkConnected);
 
 // The factory keeps common settings on one line. Port, retry interval, and
 // enabled state are optional trailing arguments when their defaults do not fit.
 ARDBConfig ardbConfig = ARDBConfig::wifiMqtt(
     WIFI_SSID, WIFI_PASSWORD, MQTT_HOST, "demo-pico-01", MQTT_PORT);
+// Each topic is published at most 10 Hz by default; pass a fourth constructor
+// argument here to override it, for example /* dataPublishRateHz */ 25.
 ARDBClient ardb(network, ardbNetwork, ardbConfig);
 ARDBTopic imuTopic;
 ARDBTopic temperatureTopic;
@@ -41,9 +53,10 @@ void setup() {
 
   // The callbacks remain explicit and board-specific, while ardb itself is
   // an object so calls use familiar dot syntax.
-  imuTopic = ardb.addTopic("a/demo/i", ARDBVisualType::Imu6I16T32, "Demo IMU");
+  imuTopic = ardb.addTopic("a/demo/i", ARDBVisualType::Imu6I16T32,
+                           "Demo IMU", 16);
   temperatureTopic = ardb.addTopic("a/demo/t", ARDBVisualType::ScalarF32,
-                                    "Demo temperature");
+                                    "Demo temperature", 4);
   logTopic = ardb.addTopic("a/demo/l", ARDBVisualType::Log, "Demo log");
   ardb.begin();
 }
