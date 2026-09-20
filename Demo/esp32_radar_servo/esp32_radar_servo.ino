@@ -2,8 +2,8 @@
  * ESP32 servo radar -> ARDB (MQTT)
  *
  *   A servo pans an HC-SR04 ultrasonic sensor across a 180-degree arc. Every
- *   step publishes one polar sample (theta, r) to the ARDB head, plus the
- *   Cartesian projection of that sample and a per-sweep nearest-target report.
+ *   step publishes ONE 8-byte packet to the ARDB head on ONE stream:
+ *   float[2] { bearing in degrees, range in centimetres }.
  *
  *   Servo signal  GPIO 32   (50 Hz LEDC, no servo library needed)
  *   Ultrasonic    GPIO 33 = TRIG (out), GPIO 25 = ECHO (in)
@@ -24,7 +24,6 @@
  */
 
 #include <WiFi.h>
-#include <math.h>
 
 #include "arduino_secrets.h"
 
@@ -42,7 +41,7 @@
 // ============================================================
 static const int SERVO_PIN = 32;
 static const int TRIG_PIN  = 33;
-static const int ECHO_PIN  = 25;
+static const int ECHO_PIN  = 13;
 
 // ============================================================
 //  CONFIG  (secrets come from arduino_secrets.h)
@@ -129,28 +128,25 @@ static const uint32_t WIFI_DOWN_RECONNECT_MS = 10000;
 // All floats below are IEEE-754 binary32 LITTLE-ENDIAN (the ESP32's in-memory
 // layout, copied verbatim by ARDBClient).
 //
-//   a/radar/polar  THREE_NUM   12 B  float[3] { thetaDeg, rCm, valid }
-//                  valid = 1.0 for a real echo, 0.0 for no echo / out of
-//                  range. rCm is 0.0 when valid is 0.0 -- read the flag, not
-//                  the radius, or an empty bearing plots as a hit at the
-//                  sensor's own origin.
+// ONE stream, ONE packet per sweep step, two fields and nothing else:
 //
-//   a/radar/pt     Vector3F32  12 B  float[3] { x, y, z } in METRES
-//                  Unity-handed: +x right, +y up, +z forward, origin at the
-//                  sensor face. y is always 0 because the servo only pans.
-//                  Published ONLY for valid echoes, so an absent sample means
-//                  "nothing at that bearing", not "something at 0,0,0".
+//   a/radar   Binary (255)   8 B   float[2] { thetaDeg, rCm }
 //
-//   a/radar/r      ScalarF32    4 B  float rCm, valid echoes only.
+//     [0] thetaDeg  bearing, 0..180, the servo angle described above.
+//     [1] rCm       range in centimetres from the sensor face.
 //
-//   a/radar/near   THREE_NUM   12 B  float[3] { thetaDeg, rCm, sweepIndex }
-//                  The closest echo of a completed pass, emitted once per
-//                  pass. sweepIndex counts passes from boot; it also keeps
-//                  consecutive payloads byte-distinct, which matters because
-//                  the head drops a sample identical to the one it already
-//                  holds.
+//     rCm == 0.0 is the NO-ECHO sentinel: the beam swept that bearing and
+//     nothing answered. It is not a target at the sensor's origin. Zero is
+//     safe as a sentinel because a real reading is always >= MIN_RANGE_CM,
+//     and with only two fields there is nowhere else to put a validity flag.
+//     A decoder that plots rCm without testing for zero will draw a false
+//     contact at the origin on every empty bearing.
 //
-//   a/radar/log    Log               UTF-8 status text, no NUL terminator.
+// Binary is the honest descriptor here: the enum has no two-number type, and
+// Binary is defined as opaque application-defined bytes, so the length and
+// this comment are the whole contract. A fixed 8 gives the head a length
+// check. Nothing else is published -- no Cartesian point, no nearest-target
+// summary, no log stream.
 
 // ============================================================
 //  ARDB - constructed in setup(), NOT as globals.
@@ -163,11 +159,15 @@ static ARDBConfig *ardbConfig = nullptr;
 static ARDBNetworkCallbacks *ardbNetwork = nullptr;
 static ARDBClient *ardb = nullptr;
 
-static ARDBTopic tPolar;    // 1
-static ARDBTopic tPoint;    // 2
-static ARDBTopic tRange;    // 3
-static ARDBTopic tNearest;  // 4
-static ARDBTopic tLog;      // 5
+static ARDBTopic tRadar;   // the only stream
+
+// float[2] {thetaDeg, rCm}. Asserted rather than assumed: the head enforces
+// the 8 declared below, and a float that is not 4 bytes would be rejected at
+// run time instead of here.
+static const uint16_t RADAR_PACKET_BYTES = 8;
+static_assert(sizeof(float) == 4, "ARDB radar packet assumes 32-bit float");
+static_assert(sizeof(float[2]) == RADAR_PACKET_BYTES,
+              "radar packet must be exactly 8 bytes");
 
 // ARDBClient's per-topic gate restarts from the moment a publish *finishes*,
 // so a 10 Hz limit against a 100 ms step drops a point whenever a publish
@@ -305,26 +305,16 @@ static void netSupervisor() {
 static float    g_angleDeg = SWEEP_MIN_DEG;  // bearing the horn is parked at
 static float    g_stepDeg = SWEEP_STEP_DEG;  // signed: flips at each end
 static uint32_t g_nextStepAt = 0;
-static uint32_t g_sweepIndex = 0;
+static uint32_t g_sweepIndex = 0;   // completed passes, for the Serial log only
 
-// Nearest echo seen so far in the pass currently underway.
-static bool  g_sweepHasHit = false;
-static float g_sweepMinCm = 0.0f;
-static float g_sweepMinDeg = 0.0f;
-
+// One publish per sweep step: bearing and range, nothing else. An empty
+// bearing still publishes, with rCm = 0 as the no-echo sentinel, so the
+// viewer keeps getting a packet per step and can clear a stale contact
+// instead of leaving the last hit on screen forever.
 static void publishSample(float thetaDeg, bool valid, float rCm) {
 #if ENABLE_ARDB
-  const float polar[3] = {thetaDeg, valid ? rCm : 0.0f, valid ? 1.0f : 0.0f};
-  ardb->print(tPolar, polar);
-
-  if (valid) {
-    // Polar -> Cartesian, cm -> m. y stays 0: the servo only pans.
-    const float rM = rCm / 100.0f;
-    const float rad = thetaDeg * (float)M_PI / 180.0f;
-    const float point[3] = {rM * cosf(rad), 0.0f, rM * sinf(rad)};
-    ardb->print(tPoint, point);
-    ardb->print(tRange, rCm);
-  }
+  const float packet[2] = {thetaDeg, valid ? rCm : 0.0f};
+  ardb->print(tRadar, packet);   // array overload sends sizeof(packet) = 8
 #else
   (void)thetaDeg;
   (void)valid;
@@ -332,36 +322,13 @@ static void publishSample(float thetaDeg, bool valid, float rCm) {
 #endif
 }
 
-static void publishSweepSummary() {
-  if (!g_sweepHasHit) {
-    Serial.printf("[sweep %lu] no echo\n", (unsigned long)g_sweepIndex);
-    return;  // an empty pass has no nearest target to report
-  }
-#if ENABLE_ARDB
-  const float nearest[3] = {g_sweepMinDeg, g_sweepMinCm, (float)g_sweepIndex};
-  ardb->print(tNearest, nearest);
-#endif
-  Serial.printf("[sweep %lu] nearest %.1f cm at %.0f deg\n",
-                (unsigned long)g_sweepIndex, g_sweepMinCm, g_sweepMinDeg);
-}
-
-// Folds one sample into the running nearest-target search.
-static void trackNearest(float thetaDeg, float rCm) {
-  if (!g_sweepHasHit || rCm < g_sweepMinCm) {
-    g_sweepHasHit = true;
-    g_sweepMinCm = rCm;
-    g_sweepMinDeg = thetaDeg;
-  }
-}
-
 // Advances g_angleDeg one step, reversing and closing out the pass at an end.
 static void advanceSweep() {
   float next = g_angleDeg + g_stepDeg;
 
   if (next > SWEEP_MAX_DEG || next < SWEEP_MIN_DEG) {
-    publishSweepSummary();
     ++g_sweepIndex;
-    g_sweepHasHit = false;
+    Serial.printf("[sweep %lu complete]\n", (unsigned long)g_sweepIndex);
 
     g_stepDeg = -g_stepDeg;
     next = g_angleDeg + g_stepDeg;
@@ -408,21 +375,13 @@ void setup() {
   ardb = new ARDBClient(*ardbTransport, *ardbNetwork, *ardbConfig,
                         ARDB_PUBLISH_RATE_HZ);
 
-  // Registration order fixes the metadata topic suffix (ardb/meta/<id>/1..5).
-  // The head assigns its own stream IDs; the Quest must use those, not these.
-  tPolar   = ardb->addTopic("a/radar/polar", ARDBVisualType::THREE_NUM,
-                            "Radar polar deg/cm/valid", 12);
-  tPoint   = ardb->addTopic("a/radar/pt", ARDBVisualType::Vector3F32,
-                            "Radar point XYZ m", 12);
-  tRange   = ardb->addTopic("a/radar/r", ARDBVisualType::ScalarF32,
-                            "Radar range cm", 4);
-  tNearest = ardb->addTopic("a/radar/near", ARDBVisualType::THREE_NUM,
-                            "Nearest deg/cm/sweep", 12);
-  tLog     = ardb->addTopic("a/radar/log", ARDBVisualType::Log, "Radar status");
+  // The single stream. The head assigns its own stream ID; the Quest must use
+  // that, not this registration position.
+  tRadar = ardb->addTopic("a/radar", ARDBVisualType::Binary,
+                          "Radar angle/range", RADAR_PACKET_BYTES);
 
-  if (!tPolar.valid() || !tPoint.valid() || !tRange.valid() ||
-      !tNearest.valid() || !tLog.valid()) {
-    Serial.println("[boot] WARNING: a topic failed to register");
+  if (!tRadar.valid()) {
+    Serial.println("[boot] WARNING: radar topic failed to register");
   }
 
   Serial.println("[boot] ardb.begin()");
@@ -443,7 +402,6 @@ void loop() {
   static bool connectionReported = false;
   if (ardb->connected() && !connectionReported) {
     connectionReported = true;
-    ardb->print(tLog, "esp32 radar online");
     Serial.println("[ardb] connected");
   } else if (!ardb->connected() && connectionReported) {
     connectionReported = false;
@@ -465,7 +423,6 @@ void loop() {
   float rCm = 0.0f;
   const bool valid = sonarPingCm(rCm);
 
-  if (valid) trackNearest(g_angleDeg, rCm);
   publishSample(g_angleDeg, valid, rCm);
 
   if (valid) {

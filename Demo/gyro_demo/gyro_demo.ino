@@ -39,7 +39,10 @@
  *             [2] yawRate deg/s (Z gyro, bias-removed; yaw angle is not
  *                 observable with a 6-axis IMU, so a rate is sent instead)
  *
- *  g/imu/t  ScalarF32 (4 B) die temperature, float32 degrees Celsius.
+ *  Die temperature is deliberately NOT published. It is read anyway as part of
+ *  the 14-byte burst and printed to Serial, but it is die temperature rather
+ *  than ambient, its accuracy is loose, and a stream slot is worth more: the
+ *  head's 8-stream budget is shared across every publisher on the broker.
  *
  *  g/imu/l  Log (variable) UTF-8 status text, no trailing NUL. Keep each
  *           message <= 64 bytes: the head drops longer application payloads.
@@ -98,8 +101,10 @@ const uint8_t REG_PWR_MGMT_1 = 0x6B;
 const uint8_t REG_WHO_AM_I = 0x75;
 
 // Full-scale conversions for the ranges configured in setup().
-const float ACCEL_COUNTS_PER_G = 16384.0f;  // +/-2 g
-const float GYRO_COUNTS_PER_DPS = 131.0f;   // +/-250 deg/s
+// Accel counts are not converted: the tilt math uses atan2 of raw counts, where
+// the scale factor cancels. The +/-2 g range is still 16384 counts/g, which is
+// the scale a Quest decoder needs for the raw stream.
+const float GYRO_COUNTS_PER_DPS = 131.0f;  // +/-250 deg/s
 
 const uint32_t SAMPLE_PERIOD_MS = 10;       // 100 Hz filter update
 const uint16_t GYRO_CALIB_SAMPLES = 600;    // ~1.2 s of averaging
@@ -196,8 +201,7 @@ static bool wifiIsConnected() { return WiFi.status() == WL_CONNECTED; }
 
 static ARDBTopic tRaw;          // 1
 static ARDBTopic tAttitude;     // 2
-static ARDBTopic tTemperature;  // 3
-static ARDBTopic tLog;          // 4
+static ARDBTopic tLog;          // 3
 static bool ardbReady = false;
 #endif
 
@@ -509,18 +513,15 @@ void setup() {
                         /* dataPublishRateHz */ 10);
 
   Serial.println(F("[boot] registering topics"));
-  // Registration order fixes the metadata topic ids ardb/meta/<clientId>/1..4.
+  // Registration order fixes the metadata topic ids ardb/meta/<clientId>/1..3.
   // Keep it stable, and clear retained metadata if you rename a topic.
   tRaw = ardb->addTopic("g/imu/r", ARDBVisualType::Imu6I16T32,
                         "Gyro raw + timestamp", sizeof(ImuRawFrame));
   tAttitude = ardb->addTopic("g/imu/k", ARDBVisualType::Vector3F32,
                              "Roll / Pitch / YawRate deg", 12);
-  tTemperature = ardb->addTopic("g/imu/t", ARDBVisualType::ScalarF32,
-                                "IMU temperature C", 4);
   tLog = ardb->addTopic("g/imu/l", ARDBVisualType::Log, "Gyro demo log");
 
-  if (!tRaw.valid() || !tAttitude.valid() || !tTemperature.valid() ||
-      !tLog.valid()) {
+  if (!tRaw.valid() || !tAttitude.valid() || !tLog.valid()) {
     Serial.println(F("[ardb] FATAL: topic registration rejected"));
   }
 
@@ -545,6 +546,7 @@ void loop() {
   static float lastRoll = 0.0f;
   static float lastPitch = 0.0f;
   static float lastYawRate = 0.0f;
+  static float lastTemperatureC = 0.0f;  // diagnostic only, not published
 
 #if ENABLE_ARDB
   if (ardbReady && ardb) {
@@ -570,9 +572,9 @@ void loop() {
 
   if ((int32_t)(now - nextHeartbeat) >= 0) {
     nextHeartbeat = now + HEARTBEAT_PERIOD_MS;
-    Serial.printf("[hb] up %lus heap %u wifi %d rssi %d", 
+    Serial.printf("[hb] up %lus heap %u wifi %d rssi %d die %.1fC",
                   (unsigned long)(now / 1000), (unsigned)ESP.getFreeHeap(),
-                  (int)WiFi.status(), (int)WiFi.RSSI());
+                  (int)WiFi.status(), (int)WiFi.RSSI(), lastTemperatureC);
 #if ENABLE_ARDB
     if (ardb) {
       Serial.printf(" ardb %d (state %d, err %d, sent %lu, dropped %lu)",
@@ -610,8 +612,12 @@ void loop() {
       lastRoll = kalmanRoll.getAngle(rollAcc, rollRate, dt);
       lastPitch = kalmanPitch.getAngle(pitchAcc, pitchRate, dt);
 
-      // Datasheet transfer function for the on-die sensor.
-      const float temperatureC = (float)rawTemp / 340.0f + 36.53f;
+      // Datasheet transfer function for the on-die sensor. Not published: it
+      // is die temperature, not ambient, and a stream slot is worth more.
+      // Useful locally for correlating gyro bias drift over a long session.
+      // The MPU-6500/9250 clones use a different formula, so a WHO_AM_I other
+      // than 0x68 makes this figure wrong.
+      lastTemperatureC = (float)rawTemp / 340.0f + 36.53f;
 
 #if ENABLE_ARDB
       if (ardbReady && ardb && ardb->connected()) {
@@ -621,10 +627,6 @@ void loop() {
 
         const float attitude[3] = {lastRoll, lastPitch, lastYawRate};
         anySent |= ardb->print(tAttitude, attitude);  // 3 * 4 = 12 bytes
-
-        // Must be float, not double: a double would be 8 bytes and fail the
-        // 4-byte length check.
-        anySent |= ardb->print(tTemperature, temperatureC);
 
         // Feeds netSupervisor(). Rate-limited calls return false, so this
         // only advances when bytes really reached the broker.

@@ -2,6 +2,11 @@ ARDBBroker/HeadCredentials.h
 ARDBBroker/BrokerNetworkCredentials.h
 main_broke/
 
-# Per-sketch credentials. Commit arduino_secrets.example.h instead.
+# Per-sketch credentials -- never commit. Commit the templates instead; the
+# repo uses both spellings, so both are explicitly re-included below.
 arduino_secrets.h
+secrets.h
 !**/arduino_secrets.example.h
+!**/arduino_secrets.h.example
+
+.DS_Store
