@@ -766,8 +766,8 @@ void setup() {
 
   Serial.println("[boot] registering topics");
   tImage = ardb->addTopic("a/cam/img", ARDBVisualType::Jpeg, "Camera JPEG");
-  tHuman = ardb->addTopic("a/cam/h", ARDBVisualType::ScalarF32,
-                          "Human present", sizeof(float));
+  tHuman = ardb->addTopic("a/cam/h", ARDBVisualType::Boolean,
+                          "Human present", 1);
   tDesc  = ardb->addTopic("a/cam/d",   ARDBVisualType::Log,       "Scene description");
   tLog   = ardb->addTopic("a/cam/log", ARDBVisualType::Log,       "Device status");
 
@@ -885,7 +885,7 @@ void loop() {
     if (fb->len <= ARDB_MAX_JPEG_APPLICATION_PAYLOAD_BYTES) {
       ardb->printBytes(tImage, fb->buf, fb->len);
     }
-    ardb->print(tHuman, human ? 1.0f : 0.0f);
+    ardb->print(tHuman, human);
 
     // String() picks the documented text overload. Passing the character
     // buffer directly would match the fixed-size-array overload and publish

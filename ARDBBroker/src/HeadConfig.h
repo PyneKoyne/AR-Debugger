@@ -27,12 +27,13 @@ constexpr uint32_t kTlsCloseFlushTimeoutMs = 20;
 constexpr size_t kMaxApplicationPayloadBytes = 64;
 constexpr size_t kMaxJpegApplicationPayloadBytes = 2048;
 constexpr uint8_t kJpegVisualType = 7;
+constexpr uint8_t kBooleanVisualType = 8;
 constexpr size_t kMaxDefinitionNameBytes = 48;
 constexpr size_t kMaxMqttTopicBytes = 64;
 // A sample frame has a one-byte count followed by a five-byte record header.
 // Keep enough body space for one maximum-sized JPEG application payload.
 constexpr size_t kMaxFrameBodyBytes = kMaxJpegApplicationPayloadBytes + 6;
-constexpr size_t kMaxHttpRequestBytes = 384;
+constexpr size_t kMaxHttpRequestBytes = 4096;
 
 static_assert(kMaxFrameBodyBytes >= kMaxJpegApplicationPayloadBytes + 6,
               "frame body must hold a count and one maximum-sized JPEG sample");

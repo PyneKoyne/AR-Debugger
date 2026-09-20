@@ -40,6 +40,7 @@ enum class ARDBVisualType : uint8_t {
   Event = 5,
   THREE_NUM = 6,
   Jpeg = 7,
+  Boolean = 8,
   Binary = 255
 };
 
@@ -195,6 +196,9 @@ class ARDBClient {
     return printText(topic, text, N == 0 ? 0 : N - 1);
   }
 
+  // Emits a Boolean stream as exactly one byte: 0 for false, 1 for true.
+  // The topic must have been registered with ARDBVisualType::Boolean.
+  bool print(const ARDBTopic& topic, bool value);
   bool print(const ARDBTopic& topic, const char* text);
   bool print(const ARDBTopic& topic, const String& text);
   bool printText(const ARDBTopic& topic, const char* text, size_t length);

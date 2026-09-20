@@ -254,6 +254,7 @@ void HeadTelemetry::ingestMetadata(const char* payload, size_t payloadLength) {
   const size_t requiredLength =
       kMetadataHeaderBytes + topicLength + nameLength + kChecksumBytes;
   if (expectedPayloadBytes > maxPayloadBytesFor(visualType) ||
+      (isBooleanVisualType(visualType) && expectedPayloadBytes != 1) ||
       topicLength == 0 || topicLength > ardb_head::kMaxMqttTopicBytes ||
       nameLength == 0 || nameLength > ardb_head::kMaxDefinitionNameBytes ||
       payloadLength != requiredLength ||
@@ -350,6 +351,11 @@ void HeadTelemetry::ingestSample(const Topic& topic, const char* payload,
     ++malformedSamples_;
     return;
   }
+  if (isBooleanVisualType(stream.visualType) &&
+      (applicationLength != 1 || bytes[0] > 1)) {
+    ++rejectedSamples_;
+    return;
+  }
 
   if (isJpegVisualType(stream.visualType)) {
     if (jpegStreamIndex_ != streamIndex) {
@@ -401,6 +407,10 @@ void HeadTelemetry::ingestSample(const Topic& topic, const char* payload,
 
 bool HeadTelemetry::isJpegVisualType(uint8_t visualType) {
   return visualType == ardb_head::kJpegVisualType;
+}
+
+bool HeadTelemetry::isBooleanVisualType(uint8_t visualType) {
+  return visualType == ardb_head::kBooleanVisualType;
 }
 
 size_t HeadTelemetry::maxPayloadBytesFor(uint8_t visualType) {

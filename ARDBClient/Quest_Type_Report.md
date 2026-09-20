@@ -4,9 +4,11 @@
 
 `ARDBVisualType` is an eight-bit **descriptor** attached to a registered
 stream. It tells Quest what the publisher intends the application bytes to
-mean. `ARDBClient` does not convert, serialize, range-check, or otherwise
-validate application bytes based on that type. It sends the bytes supplied to
-`print()`/`printBytes()` unchanged, followed by a CRC-16 trailer.
+mean. Except for the `Boolean` helper, `ARDBClient` does not convert,
+serialize, range-check, or otherwise validate application bytes based on that
+type. `print(topic, bool)` emits the canonical Boolean byte (`0x00` or
+`0x01`); other `print()`/`printBytes()` calls send their supplied bytes
+unchanged, followed by a CRC-16 trailer.
 
 That distinction is important: a type is sufficient to select a Quest decoder
 only when the publisher and Quest have also agreed on the field order, units,
@@ -42,15 +44,16 @@ length check; it is not additional type validation by the client or head.
 | `Event` (`5`) | An application-defined event record. | Variable (`0`) unless the event schema has one fixed size. | ARDB gives event bytes no special treatment. Quest needs a separately versioned schema before it can decode the payload. |
 | `THREE_NUM` (`6`) | Three related numeric values. | Fixed: `12` when the agreed form is three 32-bit floats. | The TMC6300 example uses this type for three `float` PWM-duty values (`uh`, `vh`, `wh`) and sends 12 bytes. The enum itself does not require floats, their order, or their units. |
 | `Jpeg` (`7`) | A JPEG image bitstream. | Variable (`0`) up to 2,048 bytes. | The head permits one JPEG stream and forwards valid bytes unchanged. Quest must decode the JPEG only after checking its payload length. |
+| `Boolean` (`8`) | One on/off state. | Fixed: `1`. | `ARDBClient::print(topic, bool)` emits exactly `0x00` for false or `0x01` for true. The head rejects a Boolean descriptor that is not one byte and rejects Boolean samples with any other byte value. |
 | `Binary` (`255`) | Opaque application-defined bytes. | Variable (`0`) unless the binary format is fixed. | The head forwards valid bytes to Quest unchanged. The type carries no schema, MIME type, length prefix, or encoding. |
 
 ### Consequences for a Quest decoder
 
 - Treat `visualType` as an unsigned byte, not as proof that a payload has a
-  particular layout. The broker accepts and forwards any byte value; a future
-  publisher can use a value not listed above. An unknown value should be shown
-  safely as an unknown/raw stream rather than decoded as one of the known
-  layouts.
+  particular layout. The broker accepts and forwards unknown type values; a
+  future publisher can use a value not listed above. An unknown value should
+  be shown safely as an unknown/raw stream rather than decoded as one of the
+  known layouts.
 - A fixed `expectedPayloadBytes` is the length of the **application bytes**,
   not the MQTT payload length and not an AHSP sample-record length. For
   example, an `Imu6I16T32` stream declares `16`, while its AHSP sample record
@@ -87,6 +90,11 @@ ARDBTopic temperature = ardb.addTopic("a/robot/temp",
     ARDBVisualType::ScalarF32, "Temperature", 4);
 const float temperatureC = 21.5f;
 ardb.print(temperature, temperatureC);
+
+// Boolean: one byte, 0x00 for false or 0x01 for true.
+ARDBTopic occupied = ardb.addTopic("a/robot/occupied",
+    ARDBVisualType::Boolean, "Occupied", 1);
+ardb.print(occupied, true);
 
 // Three values. The team must specify that the order is x, y, z before Quest
 // treats it as a vector.

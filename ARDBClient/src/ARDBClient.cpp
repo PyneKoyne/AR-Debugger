@@ -200,7 +200,8 @@ ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type,
                                uint16_t expectedPayloadBytes) {
   if (!hasText(topic) || !hasText(name) || strlen(topic) > 255 ||
       strlen(name) > 255 ||
-      expectedPayloadBytes > maxPayloadBytesFor(type)) {
+      expectedPayloadBytes > maxPayloadBytesFor(type) ||
+      (type == ARDBVisualType::Boolean && expectedPayloadBytes != 1)) {
     return ARDBTopic();
   }
 
@@ -227,6 +228,16 @@ ARDBTopic ARDBClient::addTopic(const char* topic, ARDBVisualType type,
   }
 
   return ARDBTopic(this, index);
+}
+
+bool ARDBClient::print(const ARDBTopic& topic, bool value) {
+  const TopicSlot* const descriptor = topicFor(topic);
+  if (descriptor == nullptr || descriptor->type != ARDBVisualType::Boolean) {
+    return false;
+  }
+
+  const uint8_t encoded = value ? 1U : 0U;
+  return publish(topic, &encoded, sizeof(encoded));
 }
 
 bool ARDBClient::print(const ARDBTopic& topic, const char* text) {

@@ -1,50 +1,46 @@
 /**
- * One-motor CW <-> CCW sine-wave test
+ * TMC6300 PWM telemetry over BLE
  *
  * Board:  Raspberry Pi Pico 2 W (RP2350)
  * Driver: TMC6300 in 6-PWM mode
  * Library: SimpleFOC
  *
- * The motor is run open-loop, so no encoder is required. Its velocity is a
- * sine wave: it smoothly accelerates CW, slows to a stop, accelerates CCW,
- * and repeats. Change MAX_VELOCITY_RAD_S and SWEEP_PERIOD_MS below to tune
- * the motion. Start with a low MOTOR_VOLT_LIMIT and raise it cautiously.
+ * This sketch replaces the old direct Pico Wi-Fi/MQTT publisher. It drives
+ * the motor exactly as before, but advertises a BLE GATT service and notifies
+ * three high-side PWM duties as a 12-byte payload (three IEEE-754 floats)
+ * every 100 ms. Flash the companion ESP32 sketch at:
+ *
+ *   Demo/pico_tmc6300_ble_ardb_bridge/esp32_pico_tmc6300_bridge.ino
+ *
+ * The ESP32 connects to this Pico, then publishes the unchanged payload on
+ * MQTT topic b/demo/a through ARDBClient. This keeps the Pico independent of
+ * the weak Wi-Fi link while preserving the original ARDB visual type and topic.
+ *
+ * Select "Raspberry Pi Pico 2 W" in Arduino IDE. This needs the RP2040
+ * Arduino core's built-in BLE library (6.1.0 or newer).
  *
  * TMC6300 wiring:
  *   UH=GP0, UL=GP1, VH=GP2, VL=GP3, WH=GP4, WL=GP5
  *   VIO=3.3V, VM=motor supply (2..11V), GND shared with the Pico
- *
- * If CW and CCW are reversed for the mechanical setup, set
- * REVERSE_DIRECTION to true (or swap any two motor phase wires).
  */
 
-#include <WiFi.h>
 #include <Arduino.h>
+#include <BLE.h>
 #include <SimpleFOC.h>
-#include <ARDBClient.h>
 #include "hardware/pwm.h"
 #include "hardware/gpio.h"
 
-const char* WIFI_SSID = "HackTheNorth";
-const char* WIFI_PASSWORD = "hackthenorth2026";
-const char* MQTT_HOST = "10.37.114.246";  // MQTT broker IP, not the Wi-Fi SSID
-const uint16_t MQTT_PORT = 1883;
+// These UUIDs differ from the generic Raspberry Pi bridge so the ESP32
+// companion can only select this TMC6300/Pico telemetry service.
+constexpr char kPwmServiceUuid[] = "a148b750-92c6-4f9a-9f61-a9f1d376adc1";
+constexpr char kPwmCharacteristicUuid[] =
+    "a148b751-92c6-4f9a-9f61-a9f1d376adc1";
+constexpr size_t kPwmPayloadBytes = 3 * sizeof(float);
+constexpr uint32_t kPwmReportIntervalMs = 100;
 
-// The RP2040 Wi-Fi core reports both an unseen AP and rejected credentials as
-// WL_CONNECT_FAILED.  Start a fresh association periodically instead of
-// waiting forever on the result of one failed WiFi.begin() call.
-constexpr uint32_t WIFI_RETRY_INTERVAL_MS = 15000UL;
-constexpr uint32_t WIFI_STATUS_INTERVAL_MS = 2000UL;
+static_assert(sizeof(float) == 4,
+              "The ESP32 bridge expects three 32-bit IEEE-754 floats.");
 
-// Leave enabled while diagnosing Wi-Fi association. This only performs one
-// passive scan before the normal connection attempt; it does not publish,
-// connect to MQTT, or initialize the motor driver.
-#define ARDB_WIFI_DIAGNOSTICS 1
-
-WiFiClient network;
-
-// Keep this declaration above the first function in the sketch. Arduino's
-// sketch preprocessor generates function prototypes before later declarations.
 struct PwmState {
   bool pwmMuxed;
   bool enabled;
@@ -53,78 +49,52 @@ struct PwmState {
   float duty;
 };
 
-void beginArdbNetwork(const char* ssid, const char* password) {
-  WiFi.mode(WIFI_STA);
-  // WiFi.begin() blocks for up to two core timeouts on the Pico.  That can
-  // starve the motor-control loop and, after a failed join, used to leave this
-  // sketch waiting permanently without issuing another association request.
-  WiFi.beginNoBlock(ssid, password);
-}
-
-const char* wifiStatusName(uint8_t status) {
-  switch (status) {
-    case WL_IDLE_STATUS:
-      return "idle/associating";
-    case WL_CONNECTED:
-      return "connected";
-    case WL_CONNECT_FAILED:
-      return "association or authentication failed";
-    case WL_CONNECTION_LOST:
-      return "connection lost";
-    case WL_DISCONNECTED:
-      return "disconnected";
-    case WL_NO_SHIELD:
-      return "Wi-Fi radio unavailable";
-    default:
-      return "unknown";
-  }
-}
-
-void reportTargetNetworkVisibility() {
-#if ARDB_WIFI_DIAGNOSTICS
-  // A scan distinguishes "the AP is not reachable" from "the AP rejected the
-  // association." The Pico Wi-Fi core reports both as WL_CONNECT_FAILED.
-  WiFi.mode(WIFI_STA);
-  Serial.println("Scanning for configured Wi-Fi network...");
-  const int8_t networkCount = WiFi.scanNetworks();
-  if (networkCount < 0) {
-    Serial.println("Wi-Fi scan failed");
-    return;
+class PwmBleService final : public BLEService, public BLEServerCallbacks {
+ public:
+  PwmBleService() : BLEService(BLEUUID(kPwmServiceUuid)) {
+    dataCharacteristic_ = new BLECharacteristic(
+        BLEUUID(kPwmCharacteristicUuid), BLERead | BLENotify,
+        "Three TMC6300 high-side PWM duties");
+    const uint8_t initialValue[kPwmPayloadBytes] = {};
+    dataCharacteristic_->setValue(initialValue, sizeof(initialValue));
+    addCharacteristic(dataCharacteristic_);
   }
 
-  bool found = false;
-  for (int8_t index = 0; index < networkCount; ++index) {
-    const char* discoveredSsid = WiFi.SSID(static_cast<uint8_t>(index));
-    if (discoveredSsid != nullptr && strcmp(discoveredSsid, WIFI_SSID) == 0) {
-      found = true;
-      Serial.print("Configured network visible: RSSI=");
-      Serial.print(WiFi.RSSI(static_cast<uint8_t>(index)));
-      Serial.print(" dBm channel=");
-      Serial.print(WiFi.channel(static_cast<uint8_t>(index)));
-      Serial.print(" security=");
-      Serial.println(WiFi.encryptionType(static_cast<uint8_t>(index)));
+  void publish(const uint8_t* payload, size_t length) {
+    if (connected_ && length == kPwmPayloadBytes) {
+      // setValue() updates the GATT value and sends a notification after the
+      // ESP32 has enabled the characteristic's notification descriptor.
+      dataCharacteristic_->setValue(payload, length);
     }
   }
-  WiFi.scanDelete();
 
-  if (!found) {
-    Serial.println("Configured network was not visible in this scan");
+  bool takeAdvertisingRestartRequest() {
+    if (!advertisingRestartRequested_) {
+      return false;
+    }
+    advertisingRestartRequested_ = false;
+    return true;
   }
-#endif
-}
 
-bool ardbNetworkConnected() {
-  return WiFi.status() == WL_CONNECTED;
-}
+ private:
+  void onConnect(BLEServer*) override {
+    connected_ = true;
+    Serial.println("BLE bridge connected");
+  }
 
-ARDBNetworkCallbacks ardbNetwork(beginArdbNetwork, ardbNetworkConnected);
+  void onDisconnect(BLEServer*) override {
+    connected_ = false;
+    // Request the restart from loop(), not from the Bluetooth callback.
+    advertisingRestartRequested_ = true;
+    Serial.println("BLE bridge disconnected");
+  }
 
-// The factory keeps common settings on one line. Port, retry interval, and
-// enabled state are optional trailing arguments when their defaults do not fit.
-ARDBConfig ardbConfig = ARDBConfig::wifiMqtt(
-    WIFI_SSID, WIFI_PASSWORD, MQTT_HOST, "demo-pico-02", MQTT_PORT);
-ARDBClient ardb(network, ardbNetwork, ardbConfig);
-ARDBTopic pwmTopic;
+  BLECharacteristic* dataCharacteristic_ = nullptr;
+  volatile bool connected_ = false;
+  volatile bool advertisingRestartRequested_ = false;
+};
+
+PwmBleService pwmBleService;
 
 PwmState readPwm(uint8_t pin) {
   const uint slice = pwm_gpio_to_slice_num(pin);
@@ -147,7 +117,7 @@ PwmState readPwm(uint8_t pin) {
 // ========================= USER CONFIG =========================
 #define POLE_PAIRS           11      // Set this for the connected motor.
 #define SUPPLY_VOLTAGE       6.0f    // TMC6300 VM voltage, in volts (2..11 V).
-#define MOTOR_VOLT_LIMIT     3.f    // Start low; increase only if needed.
+#define MOTOR_VOLT_LIMIT     3.f     // Start low; increase only if needed.
 #define MAX_VELOCITY_RAD_S   15.0f   // Peak CW/CCW speed of the sine wave.
 #define SWEEP_PERIOD_MS      8000UL  // Time for one full CW -> CCW -> CW cycle.
 #define REVERSE_DIRECTION    false
@@ -171,71 +141,27 @@ static float sineVelocityTarget() {
   return direction * MAX_VELOCITY_RAD_S * sinf(phase);
 }
 
-void printArdbConnectionStatus() {
+static void publishPwmTelemetry() {
   static uint32_t lastReportedAtMs = 0;
   const uint32_t nowMs = millis();
-  if (nowMs - lastReportedAtMs < 2000) {
+  if (nowMs - lastReportedAtMs < kPwmReportIntervalMs) {
     return;
   }
   lastReportedAtMs = nowMs;
 
-  const int wifiStatus = WiFi.status();
-  Serial.print("Wi-Fi status=");
-  Serial.print(wifiStatus);
-  if (wifiStatus == WL_CONNECTED) {
-    Serial.print(" ip=");
-    Serial.print(WiFi.localIP());
-  }
-  Serial.print(" ARDB state=");
-  Serial.print(static_cast<uint8_t>(ardb.state()));
-  Serial.print(" MQTT error=");
-  Serial.println(ardb.lastConnectError());
-}
-
-// Keep motor PWM disabled until the station has an address.  Unlike the old
-// one-shot implementation, a failed association gets a new Wi-Fi request, so
-// a temporarily unavailable AP cannot leave setup stuck forever.
-void waitForWifiBeforeMotor() {
-  uint32_t lastAttemptAtMs = millis();
-  uint32_t lastStatusAtMs = 0;
-
-  while (WiFi.status() != WL_CONNECTED) {
-    const uint32_t nowMs = millis();
-    const uint8_t status = WiFi.status();
-
-    if (nowMs - lastStatusAtMs >= WIFI_STATUS_INTERVAL_MS) {
-      lastStatusAtMs = nowMs;
-      Serial.print("Wi-Fi status: ");
-      Serial.print(wifiStatusName(status));
-      Serial.print(" (");
-      Serial.print(status);
-      Serial.println(')');
-    }
-
-    if (nowMs - lastAttemptAtMs >= WIFI_RETRY_INTERVAL_MS) {
-      Serial.println("Retrying Wi-Fi association");
-      beginArdbNetwork(WIFI_SSID, WIFI_PASSWORD);
-      lastAttemptAtMs = nowMs;
-    }
-
-    delay(25);
-  }
-
-  Serial.print("Wi-Fi connected; ip=");
-  Serial.println(WiFi.localIP());
+  const float highSideDuties[3] = {
+      readPwm(PIN_UH).duty,
+      readPwm(PIN_VH).duty,
+      readPwm(PIN_WH).duty,
+  };
+  uint8_t payload[kPwmPayloadBytes];
+  memcpy(payload, highSideDuties, sizeof(payload));
+  pwmBleService.publish(payload, sizeof(payload));
 }
 
 void setup() {
   Serial.begin(115200);
   while (!Serial && millis() < 3000) {}
-
-  // Start associating before the motor setup. The ARDB callbacks continue to
-  // own retries after this initial request.
-  Serial.println("Starting Wi-Fi association");
-  cyw43_wifi_pm(&cyw43_state, CYW43_PERFORMANCE_PM);
-  reportTargetNetworkVisibility();
-  beginArdbNetwork(WIFI_SSID, WIFI_PASSWORD);
-  waitForWifiBeforeMotor();
 
   driver.pwm_frequency = 32000;
   driver.voltage_power_supply = SUPPLY_VOLTAGE;
@@ -254,23 +180,18 @@ void setup() {
   motor.foc_modulation = FOCModulationType::SinePWM;
   motor.controller = MotionControlType::velocity_openloop;
   motor.init();
-  Serial.println("HELLO");
 
-  pwmTopic = ardb.addTopic("b/demo/a", ARDBVisualType::THREE_NUM,
-                           "Demo BLDC PWM", 12);
-  ardbConfig.mqttConnectTimeoutMs = 1000;
-  ardb.begin();
+  BLE.begin("ARDB-PWM");
+  BLE.server()->addService(&pwmBleService);
+  BLE.server()->setCallbacks(&pwmBleService);
+  BLE.startAdvertising();
+  Serial.println("TMC6300 BLE PWM peripheral ready");
 }
 
 void loop() {
-  ardb.update();  // never loops until connected; call every iteration
-  printArdbConnectionStatus();
-  static bool connectionReported = false;
-  if (ardb.connected() && !connectionReported) {
-    ardb.print(pwmTopic, "ARDB connected");  // text length is inferred
-    connectionReported = true;
-  } else if (!ardb.connected()) {
-    connectionReported = false;
+  if (pwmBleService.takeAdvertisingRestartRequest()) {
+    BLE.startAdvertising();
+    Serial.println("BLE advertising restarted");
   }
 
   // velocity_openloop integrates this target into a rotating electrical angle.
@@ -279,17 +200,5 @@ void loop() {
   motor.loopFOC();
   motor.move();
 
-  float uh = readPwm(0).duty;  // GP0
-  float vh = readPwm(2).duty;  // GP2
-  float wh = readPwm(4).duty;  // GP4
-
-  // A 96-bit array (12 bytes)
-  uint8_t bitArray96[12];
-
-  // Copy each 4-byte integer into the array
-  memcpy(bitArray96,     &uh, 4);
-  memcpy(bitArray96 + 4, &vh, 4);
-  memcpy(bitArray96 + 8, &wh, 4);
-
-  ardb.print(pwmTopic, bitArray96, 12);
+  publishPwmTelemetry();
 }

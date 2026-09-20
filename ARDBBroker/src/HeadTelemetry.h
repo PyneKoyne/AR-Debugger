@@ -72,6 +72,7 @@ class HeadTelemetry {
   static void onMqttPublish(const MqttClient* source, const Topic& topic,
                             const char* payload, size_t payloadLength);
   static bool isJpegVisualType(uint8_t visualType);
+  static bool isBooleanVisualType(uint8_t visualType);
   static size_t maxPayloadBytesFor(uint8_t visualType);
   void ingest(const Topic& topic, const char* payload, size_t payloadLength);
   void ingestMetadata(const char* payload, size_t payloadLength);

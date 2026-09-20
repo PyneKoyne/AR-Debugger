@@ -144,13 +144,15 @@ and require an exact match. Then apply metadata-specific structural checks.
 | `Imu6I16T32` | 4 | `uint32_t` timestamp + six `int16_t` values (16 bytes) |
 | `Event` | 5 | application-defined bytes |
 | `Jpeg` | 7 | JPEG bitstream, variable up to 2,048 bytes |
+| `Boolean` | 8 | one byte: `0x00` false or `0x01` true |
 | `Binary` | 255 | application-defined bytes |
 
-The enum tells the Quest how to interpret a stream; ARDB does not serialize or
-transform data. Define fixed-width fields and byte order for custom schemas,
-and avoid compiler struct padding. The example IMU structure is explicitly
-packed and 16 bytes. Treat byte order as part of the protocol even when current
-targets share little-endian layouts.
+The enum tells the Quest how to interpret a stream. ARDB leaves supplied data
+unchanged except that `print(topic, bool)` serializes `Boolean` as `0x00` or
+`0x01`. Define fixed-width fields and byte order for custom schemas, and avoid
+compiler struct padding. The example IMU structure is explicitly packed and 16
+bytes. Treat byte order as part of the protocol even when current targets share
+little-endian layouts.
 
 ## Cost, defaults, and validation
 
